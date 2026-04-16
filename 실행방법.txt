@@ -1,0 +1,14 @@
+
+소놀봇  macOS 실행방법 (사용자용)
+
+1. setup_macos.command 실행
+- 프로젝트 폴더에서 setup_macos.command를 더블클릭합니다.
+- 처음 실행 시 필요한 모듈(.venv, requirements.txt)이 자동 설치됩니다.
+- .env 파일이 없으면 멀티봇 운영에 필요한 기본 설정으로 생성됩니다.
+
+2. control_panel_macos.command 실행
+- control_panel_macos.command를 더블클릭합니다.
+- 패널에서 허용 사용자 ID를 먼저 등록한 뒤, 봇 토큰을 추가/활성화하고 Start 버튼을 누릅니다.
+
+3. 종료 방법
+- Stop 버튼으로 데몬을 중지한 뒤 패널을 종료합니다.

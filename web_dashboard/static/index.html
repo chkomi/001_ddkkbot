@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ddkkbot Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app-layout">
+
+  <!-- 상단 바 -->
+  <header class="topbar">
+    <span class="topbar-logo">ddkkbot</span>
+    <div class="topbar-status">
+      <div class="status-dot" id="topbar-dot"></div>
+      <span id="topbar-label">로딩 중...</span>
+    </div>
+    <div class="topbar-actions">
+      <button class="btn btn-primary" id="btn-start" onclick="startBot()">▶ 시작</button>
+      <button class="btn btn-danger"  id="btn-stop"  onclick="stopBot()">■ 중지</button>
+    </div>
+  </header>
+
+  <!-- 사이드바 -->
+  <nav class="sidebar">
+    <button class="nav-item active" data-section="dashboard">
+      <span class="nav-icon">⬡</span> 대시보드
+    </button>
+    <button class="nav-item" data-section="tasks">
+      <span class="nav-icon">◈</span> 작업 목록
+    </button>
+    <button class="nav-item" data-section="logs">
+      <span class="nav-icon">◎</span> 로그
+    </button>
+    <button class="nav-item" data-section="settings">
+      <span class="nav-icon">◇</span> 설정
+    </button>
+  </nav>
+
+  <!-- 메인 콘텐츠 -->
+  <main class="main-content">
+
+    <!-- ── 대시보드 패널 ──────────────────────────────── -->
+    <div id="panel-dashboard" class="section-panel" style="flex-direction:column; gap:20px;">
+
+      <div class="section">
+        <div class="section-title">봇 상태</div>
+        <div class="card-grid">
+          <div class="card">
+            <div class="card-label">상태</div>
+            <div class="card-value" id="stat-running">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">AI 엔진</div>
+            <div class="card-value" id="stat-ai">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">프로세스 ID</div>
+            <div class="card-value" id="stat-pid">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">메신저</div>
+            <div class="card-value" id="stat-platforms">—</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">AI 프로바이더</div>
+        <div class="provider-toggle">
+          <button class="provider-btn" data-provider="codex" onclick="setAIProvider('codex')">
+            <span class="provider-icon">⚡</span>
+            <span class="provider-name">Codex</span>
+            <span class="provider-desc">OpenAI Codex CLI</span>
+          </button>
+          <button class="provider-btn" data-provider="claude" onclick="setAIProvider('claude')">
+            <span class="provider-icon">◈</span>
+            <span class="provider-name">Claude</span>
+            <span class="provider-desc">Claude Code CLI</span>
+          </button>
+        </div>
+        <div class="card-sub" style="color:var(--text-muted); font-size:11px; margin-top:4px;">
+          변경 후 봇을 재시작해야 적용됩니다.
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">메신저</div>
+        <div class="messenger-list" id="messenger-list"></div>
+      </div>
+
+    </div>
+
+    <!-- ── 작업 목록 패널 ──────────────────────────────── -->
+    <div id="panel-tasks" class="section-panel" style="flex-direction:column; gap:12px; display:none;">
+      <div class="section-title">최근 작업</div>
+      <div class="task-list" id="task-list">
+        <div class="empty-state">로딩 중...</div>
+      </div>
+    </div>
+
+    <!-- ── 로그 패널 ────────────────────────────────────── -->
+    <div id="panel-logs" class="section-panel" style="flex-direction:column; gap:12px; display:none;">
+      <div style="display:flex; align-items:center; justify-content:space-between;">
+        <div class="section-title">실시간 로그</div>
+        <button class="btn btn-ghost" onclick="document.getElementById('log-viewer').innerHTML=''">지우기</button>
+      </div>
+      <div class="log-viewer" id="log-viewer"></div>
+    </div>
+
+    <!-- ── 설정 패널 ────────────────────────────────────── -->
+    <div id="panel-settings" class="section-panel" style="flex-direction:column; gap:12px; display:none;">
+      <div class="section-title">환경 설정</div>
+      <div class="card-sub" style="font-size:11px; color:var(--text-muted);">
+        민감한 값(토큰, 키)은 마스킹 표시됩니다. 직접 .env 파일을 편집하거나 아래에서 변경하세요.
+      </div>
+      <div class="settings-form" id="settings-form">
+        <div class="empty-state">로딩 중...</div>
+      </div>
+    </div>
+
+  </main>
+
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

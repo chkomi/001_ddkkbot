@@ -1,0 +1,50 @@
+# 환경 변수 (토큰 포함)
+.env
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 작업 잠금 파일
+working.json
+*.lock
+new_instructions.json
+
+# 텔레그램 메시지 데이터
+telegram_messages.json
+
+# 작업 메모리 폴더 (로컬 데이터)
+tasks/
+
+# 로그 파일
+claude_task.log
+*.log
+
+# IDE 설정
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Discord 메시지 데이터
+discord_messages.json
+
+# 프로세스 PID 파일
+*.pid
+
+# 런타임 상태
+codex-agent-rewriter-state.json
+agent-rewriter-workspace/
+chat_locks/
+logs/
+bots/
+
+# .codex 설정 (로컬)
+.codex/
+
+# OS 파일
+.DS_Store
+Thumbs.db

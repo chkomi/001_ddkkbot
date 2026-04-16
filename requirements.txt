@@ -1,0 +1,20 @@
+# 소놀봇 Python 의존성 패키지
+
+# 환경 변수 관리 (.env 파일)
+python-dotenv==1.1.1
+
+# Telegram Bot API 직접 호출
+requests==2.32.3
+
+# Claude 에이전트 어댑터: API 방식 사용 시만 필요 (기본은 claude CLI 구독 방식)
+# anthropic>=0.49.0
+
+# Discord 봇 지원 (DISCORD_BOT_TOKEN 설정 시 필요)
+discord.py>=2.3.2
+
+# Slack 봇 지원 (SLACK_BOT_TOKEN 설정 시 필요)
+slack-bolt>=1.18.0
+
+# 웹 대시보드 (WEB_DASHBOARD_ENABLED=1 시 필요)
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
