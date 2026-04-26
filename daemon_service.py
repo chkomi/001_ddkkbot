@@ -24,7 +24,7 @@ import tomllib
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 import shutil
 import errno
 from dotenv import load_dotenv
@@ -36,6 +36,8 @@ from skill_bridge import (
     get_discord_skill,
     get_messenger_skill,
 )
+import task_helpers
+import chat_state as chat_state_module
 from scripts.bot_config_store import (
     default_config_path,
     load_config as load_bots_config,
@@ -291,6 +293,207 @@ class _ProcessFileLock:
             self._fd = None
 
 
+class _StdioRpcChannel:
+    """JSON-RPC over stdio shared by codex sub-processes (app-server, agent-rewriter).
+
+    Encapsulates the previously duplicated logic between `_app_*` and `_rewriter_*`
+    method families. The owner DaemonService keeps the concrete `Popen` reference
+    on its own attributes; this channel reads it via the supplied `get_proc`
+    callable so it always reflects start/stop transitions.
+    """
+
+    def __init__(
+        self,
+        *,
+        label: str,
+        log_func: Callable[[str], None],
+        write_log: Callable[[str, str], None],
+        get_proc: Callable[[], "Optional[subprocess.Popen[str]]"],
+        send_lock: threading.Lock,
+        req_lock: threading.Lock,
+        pending: "dict[int, queue.Queue[dict[str, Any]]]",
+        event_queue: "queue.Queue[dict[str, Any]]",
+        get_default_timeout: Callable[[], float],
+        resolve_tool_user_input_answers: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> None:
+        self.label = label
+        self._log = log_func
+        self._write_log = write_log
+        self._get_proc = get_proc
+        self._send_lock = send_lock
+        self._req_lock = req_lock
+        self._pending = pending
+        self._event_queue = event_queue
+        self._get_default_timeout = get_default_timeout
+        self._resolve_user_input = resolve_tool_user_input_answers
+        self._next_id = 1
+
+    @property
+    def proc(self) -> "Optional[subprocess.Popen[str]]":
+        return self._get_proc()
+
+    def is_running(self) -> bool:
+        p = self.proc
+        return p is not None and p.poll() is None
+
+    def send_json(self, payload: dict[str, Any]) -> bool:
+        p = self.proc
+        if p is None or p.poll() is not None or p.stdin is None:
+            return False
+        rendered = json.dumps(payload, ensure_ascii=False)
+        with self._send_lock:
+            try:
+                p.stdin.write(rendered + "\n")
+                p.stdin.flush()
+                self._write_log("SEND", rendered)
+                return True
+            except Exception as exc:
+                self._log(f"WARN: {self.label} send failed: {exc}")
+                return False
+
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> bool:
+        payload: dict[str, Any] = {"method": method}
+        if params is not None:
+            payload["params"] = params
+        return self.send_json(payload)
+
+    def request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        timeout_sec: float | None = None,
+    ) -> dict[str, Any] | None:
+        if not self.is_running():
+            return None
+        with self._req_lock:
+            req_id = self._next_id
+            self._next_id += 1
+            response_q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+            self._pending[req_id] = response_q
+
+        payload: dict[str, Any] = {"id": req_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+
+        if not self.send_json(payload):
+            with self._req_lock:
+                self._pending.pop(req_id, None)
+            return None
+
+        wait_sec = timeout_sec if timeout_sec is not None else self._get_default_timeout()
+        try:
+            reply = response_q.get(timeout=max(1.0, float(wait_sec)))
+        except queue.Empty:
+            self._log(f"WARN: {self.label} request timeout method={method} id={req_id}")
+            with self._req_lock:
+                self._pending.pop(req_id, None)
+            return None
+
+        if "error" in reply:
+            self._log(
+                f"WARN: {self.label} request error method={method} id={req_id} error={reply.get('error')}"
+            )
+            return None
+        result = reply.get("result")
+        if isinstance(result, dict):
+            return result
+        return {"value": result}
+
+    def handle_server_request(self, request_obj: dict[str, Any]) -> None:
+        req_id = request_obj.get("id")
+        method = str(request_obj.get("method") or "")
+        params = request_obj.get("params")
+
+        if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
+            payload = {"id": req_id, "result": {"decision": "accept"}}
+        elif method == "item/tool/requestUserInput":
+            payload = {
+                "id": req_id,
+                "result": self._resolve_user_input(params if isinstance(params, dict) else {}),
+            }
+        elif method == "item/tool/call":
+            payload = {
+                "id": req_id,
+                "result": {
+                    "success": False,
+                    "contentItems": [
+                        {
+                            "type": "inputText",
+                            "text": "dynamic tool call is not supported by this daemon bridge",
+                        }
+                    ],
+                },
+            }
+        elif method in ("execCommandApproval", "applyPatchApproval"):
+            payload = {"id": req_id, "result": {"decision": "approved"}}
+        else:
+            payload = {"id": req_id, "result": {}}
+            self._log(
+                f"WARN: unhandled {self.label} request method={method}, replied with empty result"
+            )
+
+        if not self.send_json(payload):
+            self._log(
+                f"WARN: failed to send {self.label} request response method={method} id={req_id}"
+            )
+
+    def dispatch_incoming(self, line: str) -> None:
+        self._write_log("RECV", line)
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            self._log(f"WARN: non-json {self.label} output: {line[:180]}")
+            return
+        if not isinstance(obj, dict):
+            return
+
+        if "id" in obj and ("result" in obj or "error" in obj):
+            req_id = obj.get("id")
+            with self._req_lock:
+                pending_q = self._pending.pop(req_id, None)
+            if pending_q is not None:
+                try:
+                    pending_q.put_nowait(obj)
+                except Exception:
+                    pass
+            return
+
+        method = obj.get("method")
+        if not isinstance(method, str):
+            return
+
+        if "id" in obj:
+            self.handle_server_request(obj)
+            return
+
+        try:
+            self._event_queue.put_nowait(obj)
+        except Exception:
+            self._log(f"WARN: {self.label} event queue full; dropping event")
+
+    def stdout_reader(self) -> None:
+        p = self.proc
+        if p is None or p.stdout is None:
+            return
+        for raw in p.stdout:
+            line = raw.rstrip("\n")
+            if not line:
+                continue
+            self.dispatch_incoming(line)
+
+    def stderr_reader(self) -> None:
+        p = self.proc
+        if p is None or p.stderr is None:
+            return
+        for raw in p.stderr:
+            line = raw.rstrip("\n")
+            if not line:
+                continue
+            self._write_log("ERR", line)
+            if "ERROR" in line or "WARN" in line:
+                self._log(f"[{self.label}][stderr] {line}")
+
+
 class DaemonService:
     def __init__(self) -> None:
         self.root = Path(__file__).resolve().parent
@@ -532,6 +735,30 @@ class DaemonService:
             DEFAULT_NEW_TASK_SUMMARY_MAX_CHARS,
             minimum=1200,
         )
+        self.always_inject_recent_summary = self._env_bool(
+            "DAEMON_ALWAYS_INJECT_RECENT_SUMMARY",
+            True,
+        )
+        self.always_inject_summary_hours = self._env_int(
+            "DAEMON_ALWAYS_INJECT_SUMMARY_HOURS",
+            12,
+            minimum=1,
+        )
+        self.always_inject_summary_lines = self._env_int(
+            "DAEMON_ALWAYS_INJECT_SUMMARY_LINES",
+            20,
+            minimum=10,
+        )
+        self.always_inject_summary_max_chars = self._env_int(
+            "DAEMON_ALWAYS_INJECT_SUMMARY_MAX_CHARS",
+            3500,
+            minimum=1200,
+        )
+        self.result_summary_note_max_len = self._env_int(
+            "DAEMON_RESULT_SUMMARY_NOTE_MAX_LEN",
+            240,
+            minimum=80,
+        )
         self.task_search_llm_enabled = self._env_bool(
             "DAEMON_TASK_SEARCH_LLM_ENABLED",
             DEFAULT_TASK_SEARCH_LLM_ENABLED,
@@ -618,7 +845,18 @@ class DaemonService:
         self.app_req_lock = threading.Lock()
         self.app_pending_responses: dict[int, queue.Queue[dict[str, Any]]] = {}
         self.app_event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-        self.app_next_request_id = 1
+        self._app_channel = _StdioRpcChannel(
+            label="app-server",
+            log_func=self._log,
+            write_log=self._write_app_server_log,
+            get_proc=lambda: self.app_proc,
+            send_lock=self.app_json_send_lock,
+            req_lock=self.app_req_lock,
+            pending=self.app_pending_responses,
+            event_queue=self.app_event_queue,
+            get_default_timeout=lambda: self.app_server_request_timeout_sec,
+            resolve_tool_user_input_answers=self._resolve_tool_user_input_answers,
+        )
         self.app_chat_states: dict[int, dict[str, Any]] = {}
         self.app_thread_to_chat: dict[str, int] = {}
         self.app_turn_to_chat: dict[str, int] = {}
@@ -636,7 +874,18 @@ class DaemonService:
         self.rewriter_req_lock = threading.Lock()
         self.rewriter_pending_responses: dict[int, queue.Queue[dict[str, Any]]] = {}
         self.rewriter_event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-        self.rewriter_next_request_id = 1
+        self._rewriter_channel = _StdioRpcChannel(
+            label="agent-rewriter",
+            log_func=self._log,
+            write_log=self._write_agent_rewriter_log,
+            get_proc=lambda: self.rewriter_proc,
+            send_lock=self.rewriter_json_send_lock,
+            req_lock=self.rewriter_req_lock,
+            pending=self.rewriter_pending_responses,
+            event_queue=self.rewriter_event_queue,
+            get_default_timeout=lambda: self.agent_rewriter_request_timeout_sec,
+            resolve_tool_user_input_answers=self._resolve_tool_user_input_answers,
+        )
         self.rewriter_last_restart_try_epoch = 0.0
         self.rewriter_chat_threads: dict[int, str] = {}
         self.rewriter_turn_results: dict[str, dict[str, Any]] = {}
@@ -842,42 +1091,7 @@ class DaemonService:
             self._secure_file(log_path)
 
     def _new_chat_state(self) -> dict[str, Any]:
-        return {
-            "thread_id": "",
-            "active_turn_id": "",
-            "active_message_ids": set(),
-            "active_task_ids": set(),
-            "queued_messages": [],
-            "delta_text": "",
-            "final_text": "",
-            "last_agent_message_sent": "",
-            "last_agent_message_raw": "",
-            "last_progress_sent_at": 0.0,
-            "last_progress_len": 0,
-            "last_turn_started_at": 0.0,
-            "failed_reply_text": "",
-            "failed_reply_ids": set(),
-            "app_generation": 0,
-            "last_lease_heartbeat_at": 0.0,
-            "ui_mode": UI_MODE_IDLE,
-            "ui_mode_expires_at": 0.0,
-            "resume_choice_inline_only": False,
-            "resume_candidates": [],
-            "resume_candidate_buttons": [],
-            "resume_candidate_map": {},
-            "selected_task_id": "",
-            "selected_task_packet": "",
-            "resume_target_thread_id": "",
-            "resume_thread_switch_pending": False,
-            "resume_recent_chat_summary_once": "",
-            "resume_context_inject_once": False,
-            "pending_new_task_summary": "",
-            "force_new_thread_once": False,
-            "temp_task_first_text": "",
-            "temp_task_first_message_id": 0,
-            "temp_task_first_timestamp": "",
-            "bot_rename_base_name": "",
-        }
+        return chat_state_module.create_chat_state(ui_mode_idle=UI_MODE_IDLE)
 
     def _load_app_server_state(self) -> None:
         self.app_chat_states = {}
@@ -1793,7 +2007,7 @@ class DaemonService:
 
     @staticmethod
     def _normalize_ui_text(text: str) -> str:
-        return re.sub(r"\s+", " ", str(text or "")).strip()
+        return task_helpers.normalize_ui_text(text)
 
     @staticmethod
     def _extract_msg_id_token(text: str) -> int:
@@ -1814,18 +2028,7 @@ class DaemonService:
 
     @staticmethod
     def _normalize_task_id_token(value: object) -> str:
-        text = str(value or "").strip()
-        if not text:
-            return ""
-        if re.fullmatch(r"msg_\d+", text, flags=re.IGNORECASE):
-            return text.lower()
-        if re.fullmatch(r"thread_[A-Za-z0-9._:-]+", text, flags=re.IGNORECASE):
-            return text
-        if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", text):
-            return f"thread_{text}"
-        if text.isdigit():
-            return f"msg_{text}"
-        return ""
+        return task_helpers.normalize_task_id_token(value)
 
     def _normalize_thread_id_token(self, value: object) -> str:
         candidate = self._compact_prompt_text(value, max_len=220)
@@ -1919,18 +2122,11 @@ class DaemonService:
 
     @staticmethod
     def _build_single_task_inline_select_keyboard(task_id: str) -> list[list[dict[str, str]]]:
-        normalized = DaemonService._normalize_task_id_token(task_id)
-        if not normalized:
-            return []
-        return [[{"text": "선택", "callback_data": f"{INLINE_TASK_SELECT_CALLBACK_PREFIX}{normalized}"}]]
+        return task_helpers.build_single_task_inline_select_keyboard(task_id)
 
     @staticmethod
     def _extract_callback_task_select_id(text: str) -> str:
-        normalized = str(text or "").strip()
-        if not normalized.lower().startswith(CALLBACK_TASK_SELECT_PREFIX):
-            return ""
-        suffix = normalized[len(CALLBACK_TASK_SELECT_PREFIX) :].strip()
-        return DaemonService._normalize_task_id_token(suffix)
+        return task_helpers.extract_callback_task_select_id(text)
 
     def _set_ui_mode(self, state: dict[str, Any], mode: str) -> None:
         state["ui_mode"] = mode
@@ -2168,9 +2364,7 @@ class DaemonService:
 
     @staticmethod
     def _clear_temp_task_seed(state: dict[str, Any]) -> None:
-        state["temp_task_first_text"] = ""
-        state["temp_task_first_message_id"] = 0
-        state["temp_task_first_timestamp"] = ""
+        task_helpers.clear_temp_task_seed(state)
 
     def _build_temp_task_seed_batch(
         self,
@@ -2565,14 +2759,7 @@ class DaemonService:
 
     @staticmethod
     def _is_task_guide_edit_request_text(text: str) -> bool:
-        normalized = DaemonService._normalize_ui_text(text).lower()
-        if not normalized:
-            return False
-        if TASK_GUIDE_TRIGGER_TEXT not in normalized:
-            return False
-        if "보기" in normalized:
-            return False
-        return any(keyword in normalized for keyword in TASK_GUIDE_EDIT_KEYWORDS)
+        return task_helpers.is_task_guide_edit_request_text(text)
 
     def _default_task_agents_template(self, thread_id: str) -> str:
         normalized_thread_id = self._normalize_thread_id_token(thread_id)
@@ -3494,203 +3681,28 @@ class DaemonService:
         callback_selected_task_id = self._extract_callback_task_select_id(text)
         if msg_id <= 0 or not text:
             return False
-
         current_mode = str(state.get("ui_mode") or UI_MODE_IDLE)
-        reply_text = ""
-        keyboard_rows: list[list[str]] | None = None
+        ctx = {
+            "chat_id": chat_id,
+            "state": state,
+            "item": item,
+            "msg_id": msg_id,
+            "text": text,
+            "callback_selected_task_id": callback_selected_task_id,
+        }
+
         if text.startswith("__cb__:") and current_mode != UI_MODE_AWAITING_RESUME_CHOICE:
-            reply_text = "선택 가능한 목록이 만료되었어요. `TASK 목록 보기(최근20)`를 다시 눌러 주세요."
-            keyboard_rows = self._main_menu_keyboard_rows()
-            sent = self._telegram_send_text(chat_id=chat_id, text=reply_text, keyboard_rows=keyboard_rows, request_max_attempts=1)
-            if sent:
-                self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-            return True
-
+            return self._ui_handle_callback_expired(**ctx)
         if text == BUTTON_TASK_LIST_RECENT20:
-            self._clear_temp_task_seed(state)
-            rows = self._list_recent_tasks(chat_id=chat_id, limit=20, source_limit=300)
-            if not rows:
-                self._clear_ui_mode(state)
-                reply_text = "최근 TASK 20개를 보여드리려 했지만, 조회된 TASK가 없습니다."
-                keyboard_rows = self._main_menu_keyboard_rows()
-                inline_keyboard_rows = None
-                sent = self._telegram_send_text(
-                    chat_id=chat_id,
-                    text=reply_text,
-                    keyboard_rows=keyboard_rows,
-                    inline_keyboard_rows=inline_keyboard_rows,
-                    request_max_attempts=1,
-                    parse_mode="HTML",
-                )
-            else:
-                candidate_ids, candidate_buttons, candidate_map = self._build_resume_choice_payload(rows=rows, max_count=20)
-                state["resume_choice_inline_only"] = True
-                state["resume_candidates"] = candidate_ids
-                state["resume_candidate_buttons"] = candidate_buttons
-                state["resume_candidate_map"] = candidate_map
-                self._set_ui_mode(state, UI_MODE_AWAITING_RESUME_CHOICE)
-                header_text = self._render_task_list_text(rows=[], limit=20)
-                footer_text = "최근순으로 정렬됩니다. 특정 작업(TASK)을 이어 진행하시려면 하단의 선택 버튼을 눌러 주세요."
-                reply_text = footer_text
-                keyboard_rows = None
-                sent = self._telegram_send_text(
-                    chat_id=chat_id,
-                    text=header_text,
-                    keyboard_rows=keyboard_rows,
-                    inline_keyboard_rows=None,
-                    request_max_attempts=1,
-                    parse_mode="HTML",
-                )
-                for idx, row in enumerate(rows, start=1):
-                    row_task_id = self._task_row_id(row)
-                    if not row_task_id:
-                        continue
-                    item_text = self._render_task_item_card_text(idx=idx, row=row)
-                    item_inline_keyboard = self._build_single_task_inline_select_keyboard(task_id=row_task_id)
-                    sent_item = self._telegram_send_text(
-                        chat_id=chat_id,
-                        text=item_text,
-                        keyboard_rows=None,
-                        inline_keyboard_rows=item_inline_keyboard,
-                        request_max_attempts=1,
-                        parse_mode="HTML",
-                    )
-                    sent = bool(sent or sent_item)
-                sent_footer = self._telegram_send_text(
-                    chat_id=chat_id,
-                    text=footer_text,
-                    keyboard_rows=None,
-                    inline_keyboard_rows=None,
-                    request_max_attempts=1,
-                )
-                sent = bool(sent or sent_footer)
-            if sent:
-                self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-            return True
-
+            return self._ui_handle_task_list_recent(**ctx)
         if text == BUTTON_TASK_GUIDE_VIEW:
-            self._clear_temp_task_seed(state)
-            guide_thread_id = self._resolve_task_agents_thread_id(state)
-            if not guide_thread_id:
-                self._clear_ui_mode(state)
-                reply_text = (
-                    "현재 선택된 TASK가 없습니다.\n"
-                    "먼저 `TASK 목록 보기(최근20)` 또는 `기존 TASK 이어하기`로 TASK를 선택해 주세요."
-                )
-                sent = self._telegram_send_text(
-                    chat_id=chat_id,
-                    text=reply_text,
-                    keyboard_rows=self._main_menu_keyboard_rows(),
-                    request_max_attempts=1,
-                )
-                if sent:
-                    self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-                return True
-
-            relative_path = self._task_agents_relative_path(chat_id=chat_id, thread_id=guide_thread_id)
-            guide_text, exists = self._load_task_agents_text(chat_id=chat_id, thread_id=guide_thread_id)
-            self._set_ui_mode(state, UI_MODE_AWAITING_TASK_GUIDE_EDIT)
-            sent = False
-            if exists and guide_text.strip():
-                header_text = (
-                    f"<b>TASK 지침 파일 보기</b>\n"
-                    f"- 파일: <code>{self._escape_telegram_html(relative_path)}</code>\n"
-                    "- 아래 내용 확인 후 변경 요청을 바로 보내주세요."
-                )
-                sent_header = self._telegram_send_text(
-                    chat_id=chat_id,
-                    text=header_text,
-                    keyboard_rows=None,
-                    request_max_attempts=1,
-                    parse_mode="HTML",
-                )
-                sent = bool(sent or sent_header)
-                chunks = self._split_text_chunks(guide_text, max_chars=DEFAULT_TASK_GUIDE_TELEGRAM_CHUNK_CHARS)
-                total_chunks = len(chunks)
-                for idx, chunk in enumerate(chunks, start=1):
-                    chunk_label = f"TASK 지침 내용 ({idx}/{total_chunks})"
-                    body_text = (
-                        f"<b>{self._escape_telegram_html(chunk_label)}</b>\n"
-                        f"<pre>{self._escape_telegram_html(chunk)}</pre>"
-                    )
-                    sent_chunk = self._telegram_send_text(
-                        chat_id=chat_id,
-                        text=body_text,
-                        keyboard_rows=None,
-                        request_max_attempts=1,
-                        parse_mode="HTML",
-                    )
-                    sent = bool(sent or sent_chunk)
-                reply_text = (
-                    f"TASK 지침을 보여드렸어요. `{relative_path}` 변경 요청을 보내주시면 "
-                    "코덱스가 해당 파일을 직접 수정합니다."
-                )
-            elif exists:
-                reply_text = (
-                    f"`{relative_path}` 파일은 존재하지만 현재 내용이 비어 있습니다.\n"
-                    "원하시는 지침 내용을 보내주시면 코덱스가 파일을 수정해 반영합니다."
-                )
-            else:
-                reply_text = (
-                    f"현재 `{relative_path}` 파일이 없습니다.\n"
-                    "`TASK 지침 추가 ...` 또는 `TASK 지침 변경 ...`처럼 요청해주시면 "
-                    "해당 AGENTS.md를 생성한 뒤 바로 반영합니다."
-                )
-            sent_footer = self._telegram_send_text(
-                chat_id=chat_id,
-                text=reply_text,
-                keyboard_rows=self._main_menu_keyboard_rows(),
-                request_max_attempts=1,
-            )
-            sent = bool(sent or sent_footer)
-            if sent:
-                self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-            return True
-
+            return self._ui_handle_task_guide_view(**ctx)
         if self._is_task_guide_edit_request_text(text):
             return self._forward_task_guide_edit_request(
-                chat_id=chat_id,
-                state=state,
-                item=item,
-                msg_id=msg_id,
-                user_text=text,
+                chat_id=chat_id, state=state, item=item, msg_id=msg_id, user_text=text,
             )
-
         if text == BUTTON_BOT_RENAME:
-            self._clear_temp_task_seed(state)
-            if not self.is_bot_worker or not self.bot_id:
-                self._clear_ui_mode(state)
-                reply_text = "현재 실행 환경에서는 봇 이름 변경을 지원하지 않습니다."
-                sent = self._telegram_send_text(
-                    chat_id=chat_id,
-                    text=reply_text,
-                    keyboard_rows=self._main_menu_keyboard_rows(),
-                    request_max_attempts=1,
-                )
-                if sent:
-                    self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-                return True
-
-            base_name = self._resolve_bot_base_name()
-            state["bot_rename_base_name"] = base_name
-            self._set_ui_mode(state, UI_MODE_AWAITING_BOT_RENAME_ALIAS)
-            shown_name = base_name if base_name else "(확인 실패)"
-            reply_text = (
-                "<b>봇 이름 변경</b>\n"
-                f"현재 기본 이름: <code>{self._escape_telegram_html(shown_name)}</code>\n"
-                "원하는 별칭을 입력해 주세요.\n"
-                "적용 형식: <code>기존이름(별칭)</code>"
-            )
-            sent = self._telegram_send_text(
-                chat_id=chat_id,
-                text=reply_text,
-                keyboard_rows=self._main_menu_keyboard_rows(),
-                request_max_attempts=1,
-                parse_mode="HTML",
-            )
-            if sent:
-                self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-            return True
+            return self._ui_handle_bot_rename(**ctx)
 
         temp_mode_passthrough_buttons = {
             BUTTON_TASK_LIST_RECENT20,
@@ -3699,134 +3711,294 @@ class DaemonService:
             BUTTON_MENU_BACK,
         }
         if current_mode == UI_MODE_AWAITING_TEMP_TASK_DECISION and text not in temp_mode_passthrough_buttons:
-            if text == BUTTON_TASK_NEW:
-                state["pending_new_task_summary"] = self._build_new_task_carryover_summary(chat_id=chat_id, state=state)
-                state["force_new_thread_once"] = True
-                self._clear_selected_task_state(state)
-                queued = list(state.get("queued_messages") or [])
-                queued.extend(self._build_temp_task_seed_batch(chat_id=chat_id, state=state))
-                deduped_queued: list[dict[str, Any]] = []
-                seen_ids: set[int] = set()
-                for queued_item in queued:
-                    try:
-                        queued_msg_id = int(queued_item.get("message_id"))
-                    except Exception:
-                        continue
-                    if queued_msg_id in seen_ids:
-                        continue
-                    seen_ids.add(queued_msg_id)
-                    deduped_queued.append(queued_item)
-                state["queued_messages"] = deduped_queued
-                self._clear_temp_task_seed(state)
-                self._clear_ui_mode(state)
-                reply_text = (
-                    "새 TASK로 시작할게요.\n"
-                    "방금 보낸 내용을 첫 요청으로 이어서 처리합니다."
-                )
-                keyboard_rows = self._main_menu_keyboard_rows()
-                sent = self._telegram_send_text(
+            return self._ui_handle_temp_task_decision(**ctx)
+
+        if text == BUTTON_TASK_RESUME:
+            return self._ui_handle_task_resume_button(**ctx)
+        if text == BUTTON_TASK_NEW:
+            return self._ui_handle_task_new_button(**ctx)
+        if text == BUTTON_MENU_BACK:
+            return self._ui_handle_menu_back(**ctx)
+
+        if current_mode == UI_MODE_AWAITING_RESUME_QUERY:
+            return self._ui_handle_awaiting_resume_query(**ctx)
+        if current_mode == UI_MODE_AWAITING_RESUME_CHOICE:
+            return self._ui_handle_awaiting_resume_choice(**ctx)
+        if current_mode == UI_MODE_AWAITING_TASK_GUIDE_EDIT:
+            if callback_selected_task_id:
+                return False
+            return self._forward_task_guide_edit_request(
+                chat_id=chat_id, state=state, item=item, msg_id=msg_id, user_text=text,
+            )
+        if current_mode == UI_MODE_AWAITING_BOT_RENAME_ALIAS:
+            return self._ui_handle_awaiting_bot_rename_alias(**ctx)
+        if current_mode == UI_MODE_AWAITING_NEW_TASK_INPUT:
+            return self._ui_handle_awaiting_new_task_input(**ctx)
+        if current_mode == UI_MODE_IDLE and not callback_selected_task_id:
+            return self._ui_handle_idle(**ctx)
+
+        return False
+
+    # ------------------------------------------------------------------
+    # UI control-message handlers (extracted from _handle_single_control_message)
+    # ------------------------------------------------------------------
+
+    def _ui_handle_callback_expired(
+        self,
+        *,
+        chat_id: int,
+        state: dict[str, Any],
+        item: dict[str, Any],
+        msg_id: int,
+        text: str,
+        callback_selected_task_id: str,
+    ) -> bool:
+        reply_text = "선택 가능한 목록이 만료되었어요. `TASK 목록 보기(최근20)`를 다시 눌러 주세요."
+        keyboard_rows = self._main_menu_keyboard_rows()
+        sent = self._telegram_send_text(
+            chat_id=chat_id, text=reply_text, keyboard_rows=keyboard_rows, request_max_attempts=1
+        )
+        if sent:
+            self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+        return True
+
+    def _ui_handle_task_list_recent(
+        self,
+        *,
+        chat_id: int,
+        state: dict[str, Any],
+        item: dict[str, Any],
+        msg_id: int,
+        text: str,
+        callback_selected_task_id: str,
+    ) -> bool:
+        self._clear_temp_task_seed(state)
+        rows = self._list_recent_tasks(chat_id=chat_id, limit=20, source_limit=300)
+        if not rows:
+            self._clear_ui_mode(state)
+            reply_text = "최근 TASK 20개를 보여드리려 했지만, 조회된 TASK가 없습니다."
+            keyboard_rows = self._main_menu_keyboard_rows()
+            sent = self._telegram_send_text(
+                chat_id=chat_id,
+                text=reply_text,
+                keyboard_rows=keyboard_rows,
+                inline_keyboard_rows=None,
+                request_max_attempts=1,
+                parse_mode="HTML",
+            )
+        else:
+            candidate_ids, candidate_buttons, candidate_map = self._build_resume_choice_payload(rows=rows, max_count=20)
+            state["resume_choice_inline_only"] = True
+            state["resume_candidates"] = candidate_ids
+            state["resume_candidate_buttons"] = candidate_buttons
+            state["resume_candidate_map"] = candidate_map
+            self._set_ui_mode(state, UI_MODE_AWAITING_RESUME_CHOICE)
+            header_text = self._render_task_list_text(rows=[], limit=20)
+            footer_text = "최근순으로 정렬됩니다. 특정 작업(TASK)을 이어 진행하시려면 하단의 선택 버튼을 눌러 주세요."
+            reply_text = footer_text
+            sent = self._telegram_send_text(
+                chat_id=chat_id,
+                text=header_text,
+                keyboard_rows=None,
+                inline_keyboard_rows=None,
+                request_max_attempts=1,
+                parse_mode="HTML",
+            )
+            for idx, row in enumerate(rows, start=1):
+                row_task_id = self._task_row_id(row)
+                if not row_task_id:
+                    continue
+                item_text = self._render_task_item_card_text(idx=idx, row=row)
+                item_inline_keyboard = self._build_single_task_inline_select_keyboard(task_id=row_task_id)
+                sent_item = self._telegram_send_text(
                     chat_id=chat_id,
-                    text=reply_text,
-                    keyboard_rows=keyboard_rows,
+                    text=item_text,
+                    keyboard_rows=None,
+                    inline_keyboard_rows=item_inline_keyboard,
                     request_max_attempts=1,
+                    parse_mode="HTML",
                 )
-                if sent:
-                    self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-                return True
+                sent = bool(sent or sent_item)
+            sent_footer = self._telegram_send_text(
+                chat_id=chat_id,
+                text=footer_text,
+                keyboard_rows=None,
+                inline_keyboard_rows=None,
+                request_max_attempts=1,
+            )
+            sent = bool(sent or sent_footer)
+        if sent:
+            self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+        return True
 
-            if text == BUTTON_TASK_RESUME:
-                seed_query = str(state.get("temp_task_first_text") or "").strip()
-                if not seed_query:
-                    self._clear_temp_task_seed(state)
-                    self._set_ui_mode(state, UI_MODE_AWAITING_RESUME_QUERY)
-                    reply_text = "원하시는 TASK를 검색하겠습니다. 검색어를 입력해주세요"
-                    keyboard_rows = self._main_menu_keyboard_rows()
-                    sent = self._telegram_send_text(
-                        chat_id=chat_id,
-                        text=reply_text,
-                        keyboard_rows=keyboard_rows,
-                        request_max_attempts=1,
-                    )
-                    if sent:
-                        self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-                    return True
+    def _ui_handle_task_guide_view(
+        self,
+        *,
+        chat_id: int,
+        state: dict[str, Any],
+        item: dict[str, Any],
+        msg_id: int,
+        text: str,
+        callback_selected_task_id: str,
+    ) -> bool:
+        self._clear_temp_task_seed(state)
+        guide_thread_id = self._resolve_task_agents_thread_id(state)
+        if not guide_thread_id:
+            self._clear_ui_mode(state)
+            reply_text = (
+                "현재 선택된 TASK가 없습니다.\n"
+                "먼저 `TASK 목록 보기(최근20)` 또는 `기존 TASK 이어하기`로 TASK를 선택해 주세요."
+            )
+            sent = self._telegram_send_text(
+                chat_id=chat_id,
+                text=reply_text,
+                keyboard_rows=self._main_menu_keyboard_rows(),
+                request_max_attempts=1,
+            )
+            if sent:
+                self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+            return True
 
-                candidates = self._search_task_candidates_for_resume(
+        relative_path = self._task_agents_relative_path(chat_id=chat_id, thread_id=guide_thread_id)
+        guide_text, exists = self._load_task_agents_text(chat_id=chat_id, thread_id=guide_thread_id)
+        self._set_ui_mode(state, UI_MODE_AWAITING_TASK_GUIDE_EDIT)
+        sent = False
+        if exists and guide_text.strip():
+            header_text = (
+                f"<b>TASK 지침 파일 보기</b>\n"
+                f"- 파일: <code>{self._escape_telegram_html(relative_path)}</code>\n"
+                "- 아래 내용 확인 후 변경 요청을 바로 보내주세요."
+            )
+            sent_header = self._telegram_send_text(
+                chat_id=chat_id,
+                text=header_text,
+                keyboard_rows=None,
+                request_max_attempts=1,
+                parse_mode="HTML",
+            )
+            sent = bool(sent or sent_header)
+            chunks = self._split_text_chunks(guide_text, max_chars=DEFAULT_TASK_GUIDE_TELEGRAM_CHUNK_CHARS)
+            total_chunks = len(chunks)
+            for idx, chunk in enumerate(chunks, start=1):
+                chunk_label = f"TASK 지침 내용 ({idx}/{total_chunks})"
+                body_text = (
+                    f"<b>{self._escape_telegram_html(chunk_label)}</b>\n"
+                    f"<pre>{self._escape_telegram_html(chunk)}</pre>"
+                )
+                sent_chunk = self._telegram_send_text(
                     chat_id=chat_id,
-                    query=seed_query,
-                    limit=self.task_search_llm_limit,
-                )
-                self._clear_temp_task_seed(state)
-                if not candidates:
-                    self._set_ui_mode(state, UI_MODE_AWAITING_RESUME_QUERY)
-                    reply_text = (
-                        f"`{seed_query}`와 연관된 TASK를 찾지 못했습니다. "
-                        "다른 키워드를 입력해 주세요."
-                    )
-                    keyboard_rows = self._main_menu_keyboard_rows()
-                    sent = self._telegram_send_text(
-                        chat_id=chat_id,
-                        text=reply_text,
-                        keyboard_rows=keyboard_rows,
-                        request_max_attempts=1,
-                    )
-                    if sent:
-                        self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-                    return True
-
-                candidate_ids, candidate_buttons, candidate_map = self._build_resume_choice_payload(
-                    rows=candidates,
-                    max_count=self.task_search_llm_limit,
-                )
-                state["resume_choice_inline_only"] = True
-                state["resume_candidates"] = candidate_ids
-                state["resume_candidate_buttons"] = candidate_buttons
-                state["resume_candidate_map"] = candidate_map
-                self._set_ui_mode(state, UI_MODE_AWAITING_RESUME_CHOICE)
-                query_html = self._escape_telegram_html(seed_query)
-                header_text = (
-                    "<b>연관 TASK 후보</b>\n"
-                    f"검색어: <code>{query_html}</code>\n"
-                    "<i>연관도 높은 순으로 정렬됩니다. 항목의 선택 버튼을 눌러 주세요.</i>"
-                )
-                reply_text = header_text
-                sent = self._telegram_send_text(
-                    chat_id=chat_id,
-                    text=header_text,
+                    text=body_text,
                     keyboard_rows=None,
                     request_max_attempts=1,
                     parse_mode="HTML",
                 )
-                for idx, row in enumerate(candidates, start=1):
-                    row_task_id = self._task_row_id(row)
-                    if not row_task_id:
-                        continue
-                    item_text = self._render_task_item_card_text(idx=idx, row=row)
-                    item_inline_keyboard = self._build_single_task_inline_select_keyboard(task_id=row_task_id)
-                    sent_item = self._telegram_send_text(
-                        chat_id=chat_id,
-                        text=item_text,
-                        keyboard_rows=None,
-                        inline_keyboard_rows=item_inline_keyboard,
-                        request_max_attempts=1,
-                        parse_mode="HTML",
-                    )
-                    sent = bool(sent or sent_item)
-                footer_text = "원하시는 TASK의 선택 버튼을 누르면 바로 이어서 진행합니다."
-                sent_footer = self._telegram_send_text(
-                    chat_id=chat_id,
-                    text=footer_text,
-                    keyboard_rows=None,
-                    inline_keyboard_rows=None,
-                    request_max_attempts=1,
-                )
-                sent = bool(sent or sent_footer)
-                if sent:
-                    self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-                return True
+                sent = bool(sent or sent_chunk)
+            reply_text = (
+                f"TASK 지침을 보여드렸어요. `{relative_path}` 변경 요청을 보내주시면 "
+                "코덱스가 해당 파일을 직접 수정합니다."
+            )
+        elif exists:
+            reply_text = (
+                f"`{relative_path}` 파일은 존재하지만 현재 내용이 비어 있습니다.\n"
+                "원하시는 지침 내용을 보내주시면 코덱스가 파일을 수정해 반영합니다."
+            )
+        else:
+            reply_text = (
+                f"현재 `{relative_path}` 파일이 없습니다.\n"
+                "`TASK 지침 추가 ...` 또는 `TASK 지침 변경 ...`처럼 요청해주시면 "
+                "해당 AGENTS.md를 생성한 뒤 바로 반영합니다."
+            )
+        sent_footer = self._telegram_send_text(
+            chat_id=chat_id,
+            text=reply_text,
+            keyboard_rows=self._main_menu_keyboard_rows(),
+            request_max_attempts=1,
+        )
+        sent = bool(sent or sent_footer)
+        if sent:
+            self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+        return True
 
-            reply_text = "새 TASK로 시작할지, 기존 TASK를 이어갈지 버튼으로 선택해 주세요."
-            keyboard_rows = [[BUTTON_TASK_NEW, BUTTON_TASK_RESUME]]
+    def _ui_handle_bot_rename(
+        self,
+        *,
+        chat_id: int,
+        state: dict[str, Any],
+        item: dict[str, Any],
+        msg_id: int,
+        text: str,
+        callback_selected_task_id: str,
+    ) -> bool:
+        self._clear_temp_task_seed(state)
+        if not self.is_bot_worker or not self.bot_id:
+            self._clear_ui_mode(state)
+            reply_text = "현재 실행 환경에서는 봇 이름 변경을 지원하지 않습니다."
+            sent = self._telegram_send_text(
+                chat_id=chat_id,
+                text=reply_text,
+                keyboard_rows=self._main_menu_keyboard_rows(),
+                request_max_attempts=1,
+            )
+            if sent:
+                self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+            return True
+
+        base_name = self._resolve_bot_base_name()
+        state["bot_rename_base_name"] = base_name
+        self._set_ui_mode(state, UI_MODE_AWAITING_BOT_RENAME_ALIAS)
+        shown_name = base_name if base_name else "(확인 실패)"
+        reply_text = (
+            "<b>봇 이름 변경</b>\n"
+            f"현재 기본 이름: <code>{self._escape_telegram_html(shown_name)}</code>\n"
+            "원하는 별칭을 입력해 주세요.\n"
+            "적용 형식: <code>기존이름(별칭)</code>"
+        )
+        sent = self._telegram_send_text(
+            chat_id=chat_id,
+            text=reply_text,
+            keyboard_rows=self._main_menu_keyboard_rows(),
+            request_max_attempts=1,
+            parse_mode="HTML",
+        )
+        if sent:
+            self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+        return True
+
+    def _ui_handle_temp_task_decision(
+        self,
+        *,
+        chat_id: int,
+        state: dict[str, Any],
+        item: dict[str, Any],
+        msg_id: int,
+        text: str,
+        callback_selected_task_id: str,
+    ) -> bool:
+        if text == BUTTON_TASK_NEW:
+            state["pending_new_task_summary"] = self._build_new_task_carryover_summary(chat_id=chat_id, state=state)
+            state["force_new_thread_once"] = True
+            self._clear_selected_task_state(state)
+            queued = list(state.get("queued_messages") or [])
+            queued.extend(self._build_temp_task_seed_batch(chat_id=chat_id, state=state))
+            deduped_queued: list[dict[str, Any]] = []
+            seen_ids: set[int] = set()
+            for queued_item in queued:
+                try:
+                    queued_msg_id = int(queued_item.get("message_id"))
+                except Exception:
+                    continue
+                if queued_msg_id in seen_ids:
+                    continue
+                seen_ids.add(queued_msg_id)
+                deduped_queued.append(queued_item)
+            state["queued_messages"] = deduped_queued
+            self._clear_temp_task_seed(state)
+            self._clear_ui_mode(state)
+            reply_text = (
+                "새 TASK로 시작할게요.\n"
+                "방금 보낸 내용을 첫 요청으로 이어서 처리합니다."
+            )
+            keyboard_rows = self._main_menu_keyboard_rows()
             sent = self._telegram_send_text(
                 chat_id=chat_id,
                 text=reply_text,
@@ -3838,63 +4010,41 @@ class DaemonService:
             return True
 
         if text == BUTTON_TASK_RESUME:
-            self._clear_temp_task_seed(state)
-            self._set_ui_mode(state, UI_MODE_AWAITING_RESUME_QUERY)
-            state["resume_choice_inline_only"] = False
-            state["resume_candidates"] = []
-            state["resume_candidate_buttons"] = []
-            state["resume_candidate_map"] = {}
-            reply_text = "원하시는 TASK를 검색하겠습니다. 검색어를 입력해주세요"
-            keyboard_rows = self._main_menu_keyboard_rows()
-            sent = self._telegram_send_text(
-                chat_id=chat_id,
-                text=reply_text,
-                keyboard_rows=keyboard_rows,
-                request_max_attempts=1,
-            )
-            if sent:
-                self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-            return True
+            seed_query = str(state.get("temp_task_first_text") or "").strip()
+            if not seed_query:
+                self._clear_temp_task_seed(state)
+                self._set_ui_mode(state, UI_MODE_AWAITING_RESUME_QUERY)
+                reply_text = "원하시는 TASK를 검색하겠습니다. 검색어를 입력해주세요"
+                keyboard_rows = self._main_menu_keyboard_rows()
+                sent = self._telegram_send_text(
+                    chat_id=chat_id,
+                    text=reply_text,
+                    keyboard_rows=keyboard_rows,
+                    request_max_attempts=1,
+                )
+                if sent:
+                    self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+                return True
 
-        if text == BUTTON_TASK_NEW:
-            self._clear_temp_task_seed(state)
-            self._set_ui_mode(state, UI_MODE_AWAITING_NEW_TASK_INPUT)
-            state["resume_choice_inline_only"] = False
-            state["resume_candidates"] = []
-            state["resume_candidate_buttons"] = []
-            state["resume_candidate_map"] = {}
-            reply_text = "새 TASK로 시작할 지시를 입력해 주세요."
-            keyboard_rows = self._main_menu_keyboard_rows()
-            sent = self._telegram_send_text(
-                chat_id=chat_id,
-                text=reply_text,
-                keyboard_rows=keyboard_rows,
-                request_max_attempts=1,
-            )
-            if sent:
-                self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-            return True
-
-        if text == BUTTON_MENU_BACK:
-            self._clear_temp_task_seed(state)
-            self._clear_ui_mode(state)
-            reply_text = "메뉴로 돌아왔어요."
-            keyboard_rows = self._main_menu_keyboard_rows()
-            sent = self._telegram_send_text(chat_id=chat_id, text=reply_text, keyboard_rows=keyboard_rows, request_max_attempts=1)
-            if sent:
-                self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-            return True
-
-        if current_mode == UI_MODE_AWAITING_RESUME_QUERY:
             candidates = self._search_task_candidates_for_resume(
                 chat_id=chat_id,
-                query=text,
+                query=seed_query,
                 limit=self.task_search_llm_limit,
             )
+            self._clear_temp_task_seed(state)
             if not candidates:
-                reply_text = f"`{text}`와 연관된 TASK를 찾지 못했습니다. 다른 키워드를 입력해 주세요."
+                self._set_ui_mode(state, UI_MODE_AWAITING_RESUME_QUERY)
+                reply_text = (
+                    f"`{seed_query}`와 연관된 TASK를 찾지 못했습니다. "
+                    "다른 키워드를 입력해 주세요."
+                )
                 keyboard_rows = self._main_menu_keyboard_rows()
-                sent = self._telegram_send_text(chat_id=chat_id, text=reply_text, keyboard_rows=keyboard_rows, request_max_attempts=1)
+                sent = self._telegram_send_text(
+                    chat_id=chat_id,
+                    text=reply_text,
+                    keyboard_rows=keyboard_rows,
+                    request_max_attempts=1,
+                )
                 if sent:
                     self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
                 return True
@@ -3908,7 +4058,7 @@ class DaemonService:
             state["resume_candidate_buttons"] = candidate_buttons
             state["resume_candidate_map"] = candidate_map
             self._set_ui_mode(state, UI_MODE_AWAITING_RESUME_CHOICE)
-            query_html = self._escape_telegram_html(text)
+            query_html = self._escape_telegram_html(seed_query)
             header_text = (
                 "<b>연관 TASK 후보</b>\n"
                 f"검색어: <code>{query_html}</code>\n"
@@ -3950,208 +4100,406 @@ class DaemonService:
                 self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
             return True
 
-        if current_mode == UI_MODE_AWAITING_RESUME_CHOICE:
-            candidate_ids = [
-                self._normalize_task_id_token(v)
-                for v in (state.get("resume_candidates") or [])
-            ]
-            candidate_ids = [v for v in candidate_ids if v]
-            candidate_buttons = [self._normalize_ui_text(v) for v in (state.get("resume_candidate_buttons") or []) if self._normalize_ui_text(v)]
-            candidate_map_raw = state.get("resume_candidate_map") if isinstance(state.get("resume_candidate_map"), dict) else {}
-            inline_only = bool(state.get("resume_choice_inline_only"))
-            if callback_selected_task_id:
-                selected_task_id = callback_selected_task_id
-            else:
-                selected_task_id = self._resolve_task_choice(text=text, candidates=candidate_ids, candidate_map=candidate_map_raw)
-            if callback_selected_task_id and candidate_ids and selected_task_id not in candidate_ids:
-                reply_text = "선택 가능한 목록이 갱신되었습니다. `TASK 목록 보기(최근20)`를 다시 눌러 주세요."
-                keyboard_rows = self._main_menu_keyboard_rows()
-                sent = self._telegram_send_text(chat_id=chat_id, text=reply_text, keyboard_rows=keyboard_rows, request_max_attempts=1)
-                if sent:
-                    self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-                return True
-            if not selected_task_id:
-                if inline_only:
-                    reply_text = "목록 항목의 `선택` 버튼을 누르거나, 번호(1,2,3...) 또는 TASK ID를 입력해 주세요."
-                    keyboard_rows = None
-                else:
-                    reply_text = "후보 버튼을 누르거나, 번호(1,2,3...)를 입력해 주세요."
-                    keyboard_rows = self._build_candidate_keyboard_rows(candidate_buttons) if candidate_buttons else self._main_menu_keyboard_rows()
-                sent = self._telegram_send_text(chat_id=chat_id, text=reply_text, keyboard_rows=keyboard_rows, request_max_attempts=1)
-                if sent:
-                    self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-                return True
+        reply_text = "새 TASK로 시작할지, 기존 TASK를 이어갈지 버튼으로 선택해 주세요."
+        keyboard_rows = [[BUTTON_TASK_NEW, BUTTON_TASK_RESUME]]
+        sent = self._telegram_send_text(
+            chat_id=chat_id,
+            text=reply_text,
+            keyboard_rows=keyboard_rows,
+            request_max_attempts=1,
+        )
+        if sent:
+            self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+        return True
 
-            row = self._load_task_row(chat_id=chat_id, task_id=selected_task_id, include_instrunction=False)
-            if not row:
-                reply_text = f"{selected_task_id} TASK를 찾지 못했습니다. 다시 선택해 주세요."
-                keyboard_rows = None if inline_only else (self._build_candidate_keyboard_rows(candidate_buttons) if candidate_buttons else self._main_menu_keyboard_rows())
-                sent = self._telegram_send_text(chat_id=chat_id, text=reply_text, keyboard_rows=keyboard_rows, request_max_attempts=1)
-                if sent:
-                    self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-                return True
+    def _ui_handle_task_resume_button(
+        self,
+        *,
+        chat_id: int,
+        state: dict[str, Any],
+        item: dict[str, Any],
+        msg_id: int,
+        text: str,
+        callback_selected_task_id: str,
+    ) -> bool:
+        self._clear_temp_task_seed(state)
+        self._set_ui_mode(state, UI_MODE_AWAITING_RESUME_QUERY)
+        state["resume_choice_inline_only"] = False
+        state["resume_candidates"] = []
+        state["resume_candidate_buttons"] = []
+        state["resume_candidate_map"] = {}
+        reply_text = "원하시는 TASK를 검색하겠습니다. 검색어를 입력해주세요"
+        keyboard_rows = self._main_menu_keyboard_rows()
+        sent = self._telegram_send_text(
+            chat_id=chat_id,
+            text=reply_text,
+            keyboard_rows=keyboard_rows,
+            request_max_attempts=1,
+        )
+        if sent:
+            self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+        return True
 
-            self._set_selected_task_state(chat_id=chat_id, state=state, row=row)
-            state["resume_recent_chat_summary_once"] = self._build_recent_chat_summary(
-                chat_id=chat_id,
-                hours=DEFAULT_RESUME_CHAT_SUMMARY_HOURS,
-                target_lines=DEFAULT_RESUME_CHAT_SUMMARY_LINES,
-                max_chars=DEFAULT_RESUME_CHAT_SUMMARY_MAX_CHARS,
-                exclude_message_id=msg_id,
-            )
-            state["resume_context_inject_once"] = True
-            if not str(state.get("active_turn_id") or "").strip():
-                self._apply_selected_task_thread_target(chat_id=chat_id, state=state)
-            self._clear_ui_mode(state)
-            reply_text = (
-                f"{selected_task_id} TASK로 이어서 진행할게요.\n"
-                "이제 이어서 할 내용을 보내주시면 바로 처리합니다."
-            )
-            callback_source_message_id = int(item.get("callback_message_id", 0) or 0)
+    def _ui_handle_task_new_button(
+        self,
+        *,
+        chat_id: int,
+        state: dict[str, Any],
+        item: dict[str, Any],
+        msg_id: int,
+        text: str,
+        callback_selected_task_id: str,
+    ) -> bool:
+        self._clear_temp_task_seed(state)
+        self._set_ui_mode(state, UI_MODE_AWAITING_NEW_TASK_INPUT)
+        state["resume_choice_inline_only"] = False
+        state["resume_candidates"] = []
+        state["resume_candidate_buttons"] = []
+        state["resume_candidate_map"] = {}
+        reply_text = "새 TASK로 시작할 지시를 입력해 주세요."
+        keyboard_rows = self._main_menu_keyboard_rows()
+        sent = self._telegram_send_text(
+            chat_id=chat_id,
+            text=reply_text,
+            keyboard_rows=keyboard_rows,
+            request_max_attempts=1,
+        )
+        if sent:
+            self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+        return True
+
+    def _ui_handle_menu_back(
+        self,
+        *,
+        chat_id: int,
+        state: dict[str, Any],
+        item: dict[str, Any],
+        msg_id: int,
+        text: str,
+        callback_selected_task_id: str,
+    ) -> bool:
+        self._clear_temp_task_seed(state)
+        self._clear_ui_mode(state)
+        reply_text = "메뉴로 돌아왔어요."
+        keyboard_rows = self._main_menu_keyboard_rows()
+        sent = self._telegram_send_text(
+            chat_id=chat_id, text=reply_text, keyboard_rows=keyboard_rows, request_max_attempts=1
+        )
+        if sent:
+            self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+        return True
+
+    def _ui_handle_awaiting_resume_query(
+        self,
+        *,
+        chat_id: int,
+        state: dict[str, Any],
+        item: dict[str, Any],
+        msg_id: int,
+        text: str,
+        callback_selected_task_id: str,
+    ) -> bool:
+        candidates = self._search_task_candidates_for_resume(
+            chat_id=chat_id,
+            query=text,
+            limit=self.task_search_llm_limit,
+        )
+        if not candidates:
+            reply_text = f"`{text}`와 연관된 TASK를 찾지 못했습니다. 다른 키워드를 입력해 주세요."
             keyboard_rows = self._main_menu_keyboard_rows()
             sent = self._telegram_send_text(
-                chat_id=chat_id,
-                text=reply_text,
-                keyboard_rows=keyboard_rows,
-                request_max_attempts=1,
+                chat_id=chat_id, text=reply_text, keyboard_rows=keyboard_rows, request_max_attempts=1
             )
-            used_fallback_edit = False
-            if sent:
-                self._log(
-                    f"task_select_delivery=send_first chat_id={chat_id} task_id={selected_task_id}"
-                )
-            elif callback_selected_task_id and callback_source_message_id > 0:
-                self._log(
-                    "WARN: task_select_delivery send_first_failed "
-                    f"chat_id={chat_id} task_id={selected_task_id} callback_message_id={callback_source_message_id}"
-                )
-                sent = self._telegram_edit_message_text(
-                    chat_id=chat_id,
-                    message_id=callback_source_message_id,
-                    text=reply_text,
-                    inline_keyboard_rows=[],
-                    request_max_attempts=1,
-                )
-                used_fallback_edit = bool(sent)
-                if sent:
-                    self._log(
-                        f"task_select_delivery=fallback_edit chat_id={chat_id} task_id={selected_task_id} callback_message_id={callback_source_message_id}"
-                    )
-            if sent:
-                self._log(
-                    f"task_select_focus_mode=no_post_edit chat_id={chat_id} task_id={selected_task_id}"
-                )
             if sent:
                 self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
             return True
 
-        if current_mode == UI_MODE_AWAITING_TASK_GUIDE_EDIT:
-            if callback_selected_task_id:
-                return False
-            return self._forward_task_guide_edit_request(
+        candidate_ids, candidate_buttons, candidate_map = self._build_resume_choice_payload(
+            rows=candidates,
+            max_count=self.task_search_llm_limit,
+        )
+        state["resume_choice_inline_only"] = True
+        state["resume_candidates"] = candidate_ids
+        state["resume_candidate_buttons"] = candidate_buttons
+        state["resume_candidate_map"] = candidate_map
+        self._set_ui_mode(state, UI_MODE_AWAITING_RESUME_CHOICE)
+        query_html = self._escape_telegram_html(text)
+        header_text = (
+            "<b>연관 TASK 후보</b>\n"
+            f"검색어: <code>{query_html}</code>\n"
+            "<i>연관도 높은 순으로 정렬됩니다. 항목의 선택 버튼을 눌러 주세요.</i>"
+        )
+        reply_text = header_text
+        sent = self._telegram_send_text(
+            chat_id=chat_id,
+            text=header_text,
+            keyboard_rows=None,
+            request_max_attempts=1,
+            parse_mode="HTML",
+        )
+        for idx, row in enumerate(candidates, start=1):
+            row_task_id = self._task_row_id(row)
+            if not row_task_id:
+                continue
+            item_text = self._render_task_item_card_text(idx=idx, row=row)
+            item_inline_keyboard = self._build_single_task_inline_select_keyboard(task_id=row_task_id)
+            sent_item = self._telegram_send_text(
                 chat_id=chat_id,
-                state=state,
-                item=item,
-                msg_id=msg_id,
-                user_text=text,
+                text=item_text,
+                keyboard_rows=None,
+                inline_keyboard_rows=item_inline_keyboard,
+                request_max_attempts=1,
+                parse_mode="HTML",
             )
+            sent = bool(sent or sent_item)
+        footer_text = "원하시는 TASK의 선택 버튼을 누르면 바로 이어서 진행합니다."
+        sent_footer = self._telegram_send_text(
+            chat_id=chat_id,
+            text=footer_text,
+            keyboard_rows=None,
+            inline_keyboard_rows=None,
+            request_max_attempts=1,
+        )
+        sent = bool(sent or sent_footer)
+        if sent:
+            self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+        return True
 
-        if current_mode == UI_MODE_AWAITING_BOT_RENAME_ALIAS:
-            if callback_selected_task_id:
-                return False
-            alias = self._normalize_bot_alias(text, max_len=32)
-            if not alias:
-                reply_text = "별칭이 비어 있습니다. 1~32자 별칭을 입력해 주세요."
-                sent = self._telegram_send_text(
-                    chat_id=chat_id,
-                    text=reply_text,
-                    keyboard_rows=self._main_menu_keyboard_rows(),
-                    request_max_attempts=1,
+    def _ui_handle_awaiting_resume_choice(
+        self,
+        *,
+        chat_id: int,
+        state: dict[str, Any],
+        item: dict[str, Any],
+        msg_id: int,
+        text: str,
+        callback_selected_task_id: str,
+    ) -> bool:
+        candidate_ids = [
+            self._normalize_task_id_token(v)
+            for v in (state.get("resume_candidates") or [])
+        ]
+        candidate_ids = [v for v in candidate_ids if v]
+        candidate_buttons = [
+            self._normalize_ui_text(v)
+            for v in (state.get("resume_candidate_buttons") or [])
+            if self._normalize_ui_text(v)
+        ]
+        candidate_map_raw = state.get("resume_candidate_map") if isinstance(state.get("resume_candidate_map"), dict) else {}
+        inline_only = bool(state.get("resume_choice_inline_only"))
+        if callback_selected_task_id:
+            selected_task_id = callback_selected_task_id
+        else:
+            selected_task_id = self._resolve_task_choice(text=text, candidates=candidate_ids, candidate_map=candidate_map_raw)
+        if callback_selected_task_id and candidate_ids and selected_task_id not in candidate_ids:
+            reply_text = "선택 가능한 목록이 갱신되었습니다. `TASK 목록 보기(최근20)`를 다시 눌러 주세요."
+            keyboard_rows = self._main_menu_keyboard_rows()
+            sent = self._telegram_send_text(
+                chat_id=chat_id, text=reply_text, keyboard_rows=keyboard_rows, request_max_attempts=1
+            )
+            if sent:
+                self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+            return True
+        if not selected_task_id:
+            if inline_only:
+                reply_text = "목록 항목의 `선택` 버튼을 누르거나, 번호(1,2,3...) 또는 TASK ID를 입력해 주세요."
+                keyboard_rows = None
+            else:
+                reply_text = "후보 버튼을 누르거나, 번호(1,2,3...)를 입력해 주세요."
+                keyboard_rows = self._build_candidate_keyboard_rows(candidate_buttons) if candidate_buttons else self._main_menu_keyboard_rows()
+            sent = self._telegram_send_text(
+                chat_id=chat_id, text=reply_text, keyboard_rows=keyboard_rows, request_max_attempts=1
+            )
+            if sent:
+                self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+            return True
+
+        row = self._load_task_row(chat_id=chat_id, task_id=selected_task_id, include_instrunction=False)
+        if not row:
+            reply_text = f"{selected_task_id} TASK를 찾지 못했습니다. 다시 선택해 주세요."
+            keyboard_rows = None if inline_only else (self._build_candidate_keyboard_rows(candidate_buttons) if candidate_buttons else self._main_menu_keyboard_rows())
+            sent = self._telegram_send_text(
+                chat_id=chat_id, text=reply_text, keyboard_rows=keyboard_rows, request_max_attempts=1
+            )
+            if sent:
+                self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+            return True
+
+        self._set_selected_task_state(chat_id=chat_id, state=state, row=row)
+        state["resume_recent_chat_summary_once"] = self._build_recent_chat_summary(
+            chat_id=chat_id,
+            hours=DEFAULT_RESUME_CHAT_SUMMARY_HOURS,
+            target_lines=DEFAULT_RESUME_CHAT_SUMMARY_LINES,
+            max_chars=DEFAULT_RESUME_CHAT_SUMMARY_MAX_CHARS,
+            exclude_message_id=msg_id,
+        )
+        state["resume_context_inject_once"] = True
+        if not str(state.get("active_turn_id") or "").strip():
+            self._apply_selected_task_thread_target(chat_id=chat_id, state=state)
+        self._clear_ui_mode(state)
+        reply_text = (
+            f"{selected_task_id} TASK로 이어서 진행할게요.\n"
+            "이제 이어서 할 내용을 보내주시면 바로 처리합니다."
+        )
+        callback_source_message_id = int(item.get("callback_message_id", 0) or 0)
+        keyboard_rows = self._main_menu_keyboard_rows()
+        sent = self._telegram_send_text(
+            chat_id=chat_id,
+            text=reply_text,
+            keyboard_rows=keyboard_rows,
+            request_max_attempts=1,
+        )
+        if sent:
+            self._log(
+                f"task_select_delivery=send_first chat_id={chat_id} task_id={selected_task_id}"
+            )
+        elif callback_selected_task_id and callback_source_message_id > 0:
+            self._log(
+                "WARN: task_select_delivery send_first_failed "
+                f"chat_id={chat_id} task_id={selected_task_id} callback_message_id={callback_source_message_id}"
+            )
+            sent = self._telegram_edit_message_text(
+                chat_id=chat_id,
+                message_id=callback_source_message_id,
+                text=reply_text,
+                inline_keyboard_rows=[],
+                request_max_attempts=1,
+            )
+            if sent:
+                self._log(
+                    f"task_select_delivery=fallback_edit chat_id={chat_id} task_id={selected_task_id} callback_message_id={callback_source_message_id}"
                 )
-                if sent:
-                    self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-                return True
-
-            ok, reply_text = self._rename_bot_display_name(
-                alias_text=alias,
-                base_name_hint=state.get("bot_rename_base_name", ""),
+        if sent:
+            self._log(
+                f"task_select_focus_mode=no_post_edit chat_id={chat_id} task_id={selected_task_id}"
             )
-            if ok:
-                self._clear_ui_mode(state)
+        if sent:
+            self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+        return True
+
+    def _ui_handle_awaiting_bot_rename_alias(
+        self,
+        *,
+        chat_id: int,
+        state: dict[str, Any],
+        item: dict[str, Any],
+        msg_id: int,
+        text: str,
+        callback_selected_task_id: str,
+    ) -> bool:
+        if callback_selected_task_id:
+            return False
+        alias = self._normalize_bot_alias(text, max_len=32)
+        if not alias:
+            reply_text = "별칭이 비어 있습니다. 1~32자 별칭을 입력해 주세요."
             sent = self._telegram_send_text(
                 chat_id=chat_id,
                 text=reply_text,
                 keyboard_rows=self._main_menu_keyboard_rows(),
                 request_max_attempts=1,
-                parse_mode="HTML",
             )
             if sent:
                 self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
             return True
 
-        if current_mode == UI_MODE_AWAITING_NEW_TASK_INPUT:
-            state["pending_new_task_summary"] = self._build_new_task_carryover_summary(chat_id=chat_id, state=state)
-            state["force_new_thread_once"] = True
-            self._clear_selected_task_state(state)
+        ok, reply_text = self._rename_bot_display_name(
+            alias_text=alias,
+            base_name_hint=state.get("bot_rename_base_name", ""),
+        )
+        if ok:
             self._clear_ui_mode(state)
-            if str(state.get("active_turn_id") or "").strip():
-                self._telegram_send_text(
-                    chat_id=chat_id,
-                    text="현재 진행 중인 응답이 끝나면 새 TASK로 시작합니다.",
-                    keyboard_rows=self._main_menu_keyboard_rows(),
-                    request_max_attempts=1,
-                )
-            # Do not consume this message: it must become the first instruction of the new task.
+        sent = self._telegram_send_text(
+            chat_id=chat_id,
+            text=reply_text,
+            keyboard_rows=self._main_menu_keyboard_rows(),
+            request_max_attempts=1,
+            parse_mode="HTML",
+        )
+        if sent:
+            self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+        return True
+
+    def _ui_handle_awaiting_new_task_input(
+        self,
+        *,
+        chat_id: int,
+        state: dict[str, Any],
+        item: dict[str, Any],
+        msg_id: int,
+        text: str,
+        callback_selected_task_id: str,
+    ) -> bool:
+        state["pending_new_task_summary"] = self._build_new_task_carryover_summary(chat_id=chat_id, state=state)
+        state["force_new_thread_once"] = True
+        self._clear_selected_task_state(state)
+        self._clear_ui_mode(state)
+        if str(state.get("active_turn_id") or "").strip():
+            self._telegram_send_text(
+                chat_id=chat_id,
+                text="현재 진행 중인 응답이 끝나면 새 TASK로 시작합니다.",
+                keyboard_rows=self._main_menu_keyboard_rows(),
+                request_max_attempts=1,
+            )
+        return False
+
+    def _ui_handle_idle(
+        self,
+        *,
+        chat_id: int,
+        state: dict[str, Any],
+        item: dict[str, Any],
+        msg_id: int,
+        text: str,
+        callback_selected_task_id: str,
+    ) -> bool:
+        has_thread = bool(str(state.get("thread_id") or "").strip())
+        has_active_turn = bool(str(state.get("active_turn_id") or "").strip())
+        self._log(
+            f"[DBG] idle_check chat_id={chat_id} mode={UI_MODE_IDLE} has_thread={has_thread} "
+            f"has_active={has_active_turn} force_new={bool(state.get('force_new_thread_once'))} platform={self.platform}"
+        )
+        if has_thread or has_active_turn or bool(state.get("force_new_thread_once")):
+            return False
+        recovered_thread_id = self._recover_latest_thread_id_for_chat(chat_id=chat_id)
+        self._log(f"[DBG] recovered_thread={repr(recovered_thread_id)}")
+        if recovered_thread_id:
+            state["thread_id"] = recovered_thread_id
+            state["app_generation"] = 0
+            self._clear_temp_task_seed(state)
+            self._save_app_server_state()
+            self._sync_app_server_session_meta(active_chat_id=chat_id)
+            self._log(
+                f"cold_start_auto_resume_thread chat_id={chat_id} thread_id={recovered_thread_id} "
+                f"msg_id={msg_id}"
+            )
             return False
 
-        if current_mode == UI_MODE_IDLE and not callback_selected_task_id:
-            has_thread = bool(str(state.get("thread_id") or "").strip())
-            has_active_turn = bool(str(state.get("active_turn_id") or "").strip())
-            self._log(f"[DBG] idle_check chat_id={chat_id} mode={current_mode} has_thread={has_thread} has_active={has_active_turn} force_new={bool(state.get('force_new_thread_once'))} platform={self.platform}")
-            if not has_thread and not has_active_turn and not bool(state.get("force_new_thread_once")):
-                recovered_thread_id = self._recover_latest_thread_id_for_chat(chat_id=chat_id)
-                self._log(f"[DBG] recovered_thread={repr(recovered_thread_id)}")
-                if recovered_thread_id:
-                    state["thread_id"] = recovered_thread_id
-                    state["app_generation"] = 0
-                    self._clear_temp_task_seed(state)
-                    self._save_app_server_state()
-                    self._sync_app_server_session_meta(active_chat_id=chat_id)
-                    self._log(
-                        f"cold_start_auto_resume_thread chat_id={chat_id} thread_id={recovered_thread_id} "
-                        f"msg_id={msg_id}"
-                    )
-                    return False
+        if self.platform == "discord":
+            state["force_new_thread_once"] = True
+            self._clear_selected_task_state(state)
+            self._clear_temp_task_seed(state)
+            return False
 
-                # Discord는 버튼 클릭이 없으므로 선택 단계 없이 바로 새 TASK 시작
-                if self.platform == "discord":
-                    state["force_new_thread_once"] = True
-                    self._clear_selected_task_state(state)
-                    self._clear_temp_task_seed(state)
-                    return False
-
-                state["temp_task_first_text"] = text
-                state["temp_task_first_message_id"] = msg_id
-                state["temp_task_first_timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self._set_ui_mode(state, UI_MODE_AWAITING_TEMP_TASK_DECISION)
-                prompt_seed = self._escape_telegram_html(self._compact_prompt_text(text, max_len=120))
-                reply_text = (
-                    f"말씀하신 내용(<code>{prompt_seed}</code>)을 기준으로 시작할게요.\n"
-                    "새 TASK로 시작할지, 기존 TASK를 이어갈지 선택해 주세요."
-                )
-                keyboard_rows = [[BUTTON_TASK_NEW, BUTTON_TASK_RESUME]]
-                sent = self._telegram_send_text(
-                    chat_id=chat_id,
-                    text=reply_text,
-                    keyboard_rows=keyboard_rows,
-                    request_max_attempts=1,
-                    parse_mode="HTML",
-                )
-                if sent:
-                    self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
-                return True
-
-        return False
+        state["temp_task_first_text"] = text
+        state["temp_task_first_message_id"] = msg_id
+        state["temp_task_first_timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._set_ui_mode(state, UI_MODE_AWAITING_TEMP_TASK_DECISION)
+        prompt_seed = self._escape_telegram_html(self._compact_prompt_text(text, max_len=120))
+        reply_text = (
+            f"말씀하신 내용(<code>{prompt_seed}</code>)을 기준으로 시작할게요.\n"
+            "새 TASK로 시작할지, 기존 TASK를 이어갈지 선택해 주세요."
+        )
+        keyboard_rows = [[BUTTON_TASK_NEW, BUTTON_TASK_RESUME]]
+        sent = self._telegram_send_text(
+            chat_id=chat_id,
+            text=reply_text,
+            keyboard_rows=keyboard_rows,
+            request_max_attempts=1,
+            parse_mode="HTML",
+        )
+        if sent:
+            self._finalize_control_message(chat_id=chat_id, message_id=msg_id, reply_text=reply_text)
+        return True
 
     def _snapshot_pending_messages(self) -> list[dict[str, object]]:
         runtime, telegram = self._get_telegram_runtime_skill()
@@ -4447,6 +4795,10 @@ class DaemonService:
         else:
             note = f"app-server turn 종료(status={status})"
 
+        note_summary = self._compact_prompt_text(summary, max_len=self.result_summary_note_max_len)
+        if note_summary:
+            note = f"{note} | 응답요약: {note_summary}"
+
         for task_id in sorted(normalized_task_ids):
             try:
                 task_skill.record_task_change(
@@ -4556,27 +4908,13 @@ class DaemonService:
         return self._compact_prompt_text(normalized, max_len=700)
 
     def _rewriter_is_running(self) -> bool:
-        return self.rewriter_proc is not None and self.rewriter_proc.poll() is None
+        return self._rewriter_channel.is_running()
 
     def _rewriter_send_json(self, payload: dict[str, Any]) -> bool:
-        if not self._rewriter_is_running() or self.rewriter_proc is None or self.rewriter_proc.stdin is None:
-            return False
-        rendered = json.dumps(payload, ensure_ascii=False)
-        with self.rewriter_json_send_lock:
-            try:
-                self.rewriter_proc.stdin.write(rendered + "\n")
-                self.rewriter_proc.stdin.flush()
-                self._write_agent_rewriter_log("SEND", rendered)
-                return True
-            except Exception as exc:
-                self._log(f"WARN: agent-rewriter send failed: {exc}")
-                return False
+        return self._rewriter_channel.send_json(payload)
 
     def _rewriter_notify(self, method: str, params: dict[str, Any] | None = None) -> bool:
-        payload: dict[str, Any] = {"method": method}
-        if params is not None:
-            payload["params"] = params
-        return self._rewriter_send_json(payload)
+        return self._rewriter_channel.notify(method, params)
 
     def _rewriter_request(
         self,
@@ -4584,135 +4922,19 @@ class DaemonService:
         params: dict[str, Any] | None = None,
         timeout_sec: float | None = None,
     ) -> dict[str, Any] | None:
-        if not self._rewriter_is_running():
-            return None
-
-        with self.rewriter_req_lock:
-            req_id = self.rewriter_next_request_id
-            self.rewriter_next_request_id += 1
-            response_q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
-            self.rewriter_pending_responses[req_id] = response_q
-
-        payload: dict[str, Any] = {"id": req_id, "method": method}
-        if params is not None:
-            payload["params"] = params
-
-        if not self._rewriter_send_json(payload):
-            with self.rewriter_req_lock:
-                self.rewriter_pending_responses.pop(req_id, None)
-            return None
-
-        wait_sec = timeout_sec if timeout_sec is not None else self.agent_rewriter_request_timeout_sec
-        try:
-            reply = response_q.get(timeout=max(1.0, float(wait_sec)))
-        except queue.Empty:
-            self._log(f"WARN: agent-rewriter request timeout method={method} id={req_id}")
-            with self.rewriter_req_lock:
-                self.rewriter_pending_responses.pop(req_id, None)
-            return None
-
-        if "error" in reply:
-            self._log(f"WARN: agent-rewriter request error method={method} id={req_id} error={reply.get('error')}")
-            return None
-        result = reply.get("result")
-        if isinstance(result, dict):
-            return result
-        return {"value": result}
+        return self._rewriter_channel.request(method, params, timeout_sec)
 
     def _rewriter_handle_server_request(self, request_obj: dict[str, Any]) -> None:
-        req_id = request_obj.get("id")
-        method = str(request_obj.get("method") or "")
-        params = request_obj.get("params")
-        payload: dict[str, Any]
-
-        if method == "item/commandExecution/requestApproval":
-            payload = {"id": req_id, "result": {"decision": "accept"}}
-        elif method == "item/fileChange/requestApproval":
-            payload = {"id": req_id, "result": {"decision": "accept"}}
-        elif method == "item/tool/requestUserInput":
-            payload = {
-                "id": req_id,
-                "result": self._resolve_tool_user_input_answers(params if isinstance(params, dict) else {}),
-            }
-        elif method == "item/tool/call":
-            payload = {
-                "id": req_id,
-                "result": {
-                    "success": False,
-                    "contentItems": [
-                        {
-                            "type": "inputText",
-                            "text": "dynamic tool call is not supported by this daemon bridge",
-                        }
-                    ],
-                },
-            }
-        elif method == "execCommandApproval":
-            payload = {"id": req_id, "result": {"decision": "approved"}}
-        elif method == "applyPatchApproval":
-            payload = {"id": req_id, "result": {"decision": "approved"}}
-        else:
-            payload = {"id": req_id, "result": {}}
-            self._log(f"WARN: unhandled agent-rewriter request method={method}, replied with empty result")
-
-        if not self._rewriter_send_json(payload):
-            self._log(f"WARN: failed to send agent-rewriter request response method={method} id={req_id}")
+        self._rewriter_channel.handle_server_request(request_obj)
 
     def _rewriter_dispatch_incoming(self, line: str) -> None:
-        self._write_agent_rewriter_log("RECV", line)
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            self._log(f"WARN: non-json agent-rewriter output: {line[:180]}")
-            return
-        if not isinstance(obj, dict):
-            return
-
-        if "id" in obj and ("result" in obj or "error" in obj):
-            req_id = obj.get("id")
-            with self.rewriter_req_lock:
-                pending_q = self.rewriter_pending_responses.pop(req_id, None)
-            if pending_q is not None:
-                try:
-                    pending_q.put_nowait(obj)
-                except Exception:
-                    pass
-            return
-
-        method = obj.get("method")
-        if not isinstance(method, str):
-            return
-
-        if "id" in obj:
-            self._rewriter_handle_server_request(obj)
-            return
-
-        try:
-            self.rewriter_event_queue.put_nowait(obj)
-        except Exception:
-            self._log("WARN: agent-rewriter event queue full; dropping event")
+        self._rewriter_channel.dispatch_incoming(line)
 
     def _rewriter_stdout_reader(self) -> None:
-        proc = self.rewriter_proc
-        if proc is None or proc.stdout is None:
-            return
-        for raw in proc.stdout:
-            line = raw.rstrip("\n")
-            if not line:
-                continue
-            self._rewriter_dispatch_incoming(line)
+        self._rewriter_channel.stdout_reader()
 
     def _rewriter_stderr_reader(self) -> None:
-        proc = self.rewriter_proc
-        if proc is None or proc.stderr is None:
-            return
-        for raw in proc.stderr:
-            line = raw.rstrip("\n")
-            if not line:
-                continue
-            self._write_agent_rewriter_log("ERR", line)
-            if "ERROR" in line or "WARN" in line:
-                self._log(f"[agent-rewriter][stderr] {line}")
+        self._rewriter_channel.stderr_reader()
 
     def _rewriter_process_notification(self, event: dict[str, Any]) -> None:
         method = str(event.get("method") or "")
@@ -5026,27 +5248,13 @@ class DaemonService:
         return self._build_agent_rewriter_fallback(chat_id=chat_id, state=state, raw_text=raw)
 
     def _app_is_running(self) -> bool:
-        return self.app_proc is not None and self.app_proc.poll() is None
+        return self._app_channel.is_running()
 
     def _app_send_json(self, payload: dict[str, Any]) -> bool:
-        if not self._app_is_running() or self.app_proc is None or self.app_proc.stdin is None:
-            return False
-        rendered = json.dumps(payload, ensure_ascii=False)
-        with self.app_json_send_lock:
-            try:
-                self.app_proc.stdin.write(rendered + "\n")
-                self.app_proc.stdin.flush()
-                self._write_app_server_log("SEND", rendered)
-                return True
-            except Exception as exc:
-                self._log(f"WARN: app-server send failed: {exc}")
-                return False
+        return self._app_channel.send_json(payload)
 
     def _app_notify(self, method: str, params: dict[str, Any] | None = None) -> bool:
-        payload: dict[str, Any] = {"method": method}
-        if params is not None:
-            payload["params"] = params
-        return self._app_send_json(payload)
+        return self._app_channel.notify(method, params)
 
     def _app_request(
         self,
@@ -5054,41 +5262,7 @@ class DaemonService:
         params: dict[str, Any] | None = None,
         timeout_sec: float | None = None,
     ) -> dict[str, Any] | None:
-        if not self._app_is_running():
-            return None
-
-        req_id = 0
-        response_q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
-        with self.app_req_lock:
-            req_id = self.app_next_request_id
-            self.app_next_request_id += 1
-            self.app_pending_responses[req_id] = response_q
-
-        payload: dict[str, Any] = {"id": req_id, "method": method}
-        if params is not None:
-            payload["params"] = params
-
-        if not self._app_send_json(payload):
-            with self.app_req_lock:
-                self.app_pending_responses.pop(req_id, None)
-            return None
-
-        wait_sec = timeout_sec if timeout_sec is not None else self.app_server_request_timeout_sec
-        try:
-            reply = response_q.get(timeout=max(1.0, wait_sec))
-        except queue.Empty:
-            self._log(f"WARN: app-server request timeout method={method} id={req_id}")
-            with self.app_req_lock:
-                self.app_pending_responses.pop(req_id, None)
-            return None
-
-        if "error" in reply:
-            self._log(f"WARN: app-server request error method={method} id={req_id} error={reply.get('error')}")
-            return None
-        result = reply.get("result")
-        if isinstance(result, dict):
-            return result
-        return {"value": result}
+        return self._app_channel.request(method, params, timeout_sec)
 
     def _resolve_tool_user_input_answers(self, params: dict[str, Any]) -> dict[str, Any]:
         answers: dict[str, Any] = {}
@@ -5114,100 +5288,16 @@ class DaemonService:
         return {"answers": answers}
 
     def _app_handle_server_request(self, request_obj: dict[str, Any]) -> None:
-        req_id = request_obj.get("id")
-        method = str(request_obj.get("method") or "")
-        params = request_obj.get("params")
-        payload: dict[str, Any]
-
-        if method == "item/commandExecution/requestApproval":
-            payload = {"id": req_id, "result": {"decision": "accept"}}
-        elif method == "item/fileChange/requestApproval":
-            payload = {"id": req_id, "result": {"decision": "accept"}}
-        elif method == "item/tool/requestUserInput":
-            payload = {
-                "id": req_id,
-                "result": self._resolve_tool_user_input_answers(params if isinstance(params, dict) else {}),
-            }
-        elif method == "item/tool/call":
-            payload = {
-                "id": req_id,
-                "result": {
-                    "success": False,
-                    "contentItems": [
-                        {
-                            "type": "inputText",
-                            "text": "dynamic tool call is not supported by this daemon bridge",
-                        }
-                    ],
-                },
-            }
-        elif method == "execCommandApproval":
-            payload = {"id": req_id, "result": {"decision": "approved"}}
-        elif method == "applyPatchApproval":
-            payload = {"id": req_id, "result": {"decision": "approved"}}
-        else:
-            payload = {"id": req_id, "result": {}}
-            self._log(f"WARN: unhandled app-server request method={method}, replied with empty result")
-
-        if not self._app_send_json(payload):
-            self._log(f"WARN: failed to send app-server request response method={method} id={req_id}")
+        self._app_channel.handle_server_request(request_obj)
 
     def _app_dispatch_incoming(self, line: str) -> None:
-        self._write_app_server_log("RECV", line)
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            self._log(f"WARN: non-json app-server output: {line[:180]}")
-            return
-        if not isinstance(obj, dict):
-            return
-
-        if "id" in obj and ("result" in obj or "error" in obj):
-            req_id = obj.get("id")
-            with self.app_req_lock:
-                pending_q = self.app_pending_responses.pop(req_id, None)
-            if pending_q is not None:
-                try:
-                    pending_q.put_nowait(obj)
-                except Exception:
-                    pass
-            return
-
-        method = obj.get("method")
-        if not isinstance(method, str):
-            return
-
-        # Server request (expects response).
-        if "id" in obj:
-            self._app_handle_server_request(obj)
-            return
-
-        try:
-            self.app_event_queue.put_nowait(obj)
-        except Exception:
-            self._log("WARN: app-server event queue full; dropping event")
+        self._app_channel.dispatch_incoming(line)
 
     def _app_stdout_reader(self) -> None:
-        proc = self.app_proc
-        if proc is None or proc.stdout is None:
-            return
-        for raw in proc.stdout:
-            line = raw.rstrip("\n")
-            if not line:
-                continue
-            self._app_dispatch_incoming(line)
+        self._app_channel.stdout_reader()
 
     def _app_stderr_reader(self) -> None:
-        proc = self.app_proc
-        if proc is None or proc.stderr is None:
-            return
-        for raw in proc.stderr:
-            line = raw.rstrip("\n")
-            if not line:
-                continue
-            self._write_app_server_log("ERR", line)
-            if "ERROR" in line or "WARN" in line:
-                self._log(f"[app-server][stderr] {line}")
+        self._app_channel.stderr_reader()
 
     def _stop_app_server(self, reason: str) -> None:
         if self.app_proc is not None:
@@ -5540,6 +5630,19 @@ class DaemonService:
         resume_recent_chat_summary = ""
         if bool(state.get("resume_context_inject_once")):
             resume_recent_chat_summary = str(state.get("resume_recent_chat_summary_once") or "").strip()
+        elif self.always_inject_recent_summary:
+            exclude_msg_id = max(batch_message_ids) if batch_message_ids else None
+            try:
+                resume_recent_chat_summary = self._build_recent_chat_summary(
+                    chat_id=chat_id,
+                    hours=self.always_inject_summary_hours,
+                    target_lines=self.always_inject_summary_lines,
+                    max_chars=self.always_inject_summary_max_chars,
+                    exclude_message_id=exclude_msg_id,
+                )
+            except Exception as exc:
+                self._log(f"WARN: auto recent chat summary failed chat_id={chat_id}: {exc}")
+                resume_recent_chat_summary = ""
         carryover_summary = str(state.get("pending_new_task_summary") or "").strip()
 
         payload = {
@@ -6256,6 +6359,8 @@ class DaemonService:
         return latest
 
     def _is_bot_workspace_idle(self) -> bool:
+        if int(self.idle_timeout_sec) <= 0:
+            return False
         latest = self._workspace_latest_mtime()
         if latest <= 0:
             return False
