@@ -34,6 +34,7 @@ from skill_bridge import (
     get_task_skill,
     get_telegram_skill,
     get_discord_skill,
+    get_slack_skill,
     get_messenger_skill,
 )
 import task_helpers
@@ -500,10 +501,15 @@ class DaemonService:
         self.logs_dir = Path(os.getenv("LOGS_DIR", str(self.root / "logs"))).resolve()
         self.tasks_dir = Path(os.getenv("TASKS_DIR", str(self.root / "tasks"))).resolve()
         self.platform = os.getenv("SONOLBOT_PLATFORM", "telegram").strip().lower()
-        _default_store = (
-            "discord_messages.json" if self.platform == "discord" else "telegram_messages.json"
-        )
-        _store_env = "DISCORD_MESSAGE_STORE" if self.platform == "discord" else "TELEGRAM_MESSAGE_STORE"
+        if self.platform == "discord":
+            _default_store = "discord_messages.json"
+            _store_env = "DISCORD_MESSAGE_STORE"
+        elif self.platform == "slack":
+            _default_store = "slack_messages.json"
+            _store_env = "SLACK_MESSAGE_STORE"
+        else:
+            _default_store = "telegram_messages.json"
+            _store_env = "TELEGRAM_MESSAGE_STORE"
         self.store_file = Path(os.getenv(_store_env, str(self.root / _default_store))).resolve()
         self.is_bot_worker = (os.getenv("DAEMON_BOT_WORKER", "0").strip() == "1")
         self.bot_id = (os.getenv("SONOLBOT_BOT_ID", "") or "").strip()
@@ -1045,10 +1051,16 @@ class DaemonService:
 
     def _build_codex_app_server_cmd(self, role: str) -> list[str]:
         ai_provider = os.getenv("SONOLBOT_AI_PROVIDER", "codex").strip().lower()
-        if ai_provider == "claude":
+        if ai_provider in ("claude", "hybrid"):
             claude_model = os.getenv("SONOLBOT_CLAUDE_MODEL", "claude-opus-4-6")
             if role == "app-server":
-                self._log(f"[AI] provider=claude model={claude_model}")
+                if ai_provider == "hybrid":
+                    self._log(f"[AI] provider=hybrid (claude+codex) model={claude_model}")
+                else:
+                    self._log(f"[AI] provider=claude model={claude_model}")
+            if ai_provider == "hybrid":
+                # self.env는 os.environ 복사본이라 직접 수정해야 subprocess에 전달됨
+                self.env["SONOLBOT_HYBRID_CODEX"] = "1"
             return [sys.executable, str(self.root / "claude_app_server.py"), "--listen", self.app_server_listen]
         # 기본: codex app-server
         cmd = ["codex", "app-server", "--listen", self.app_server_listen]
@@ -1942,6 +1954,9 @@ class DaemonService:
             if self.platform == "discord":
                 runtime = build_messenger_runtime()
                 skill = get_discord_skill()
+            elif self.platform == "slack":
+                runtime = build_messenger_runtime()
+                skill = get_slack_skill()
             else:
                 runtime = build_telegram_runtime()
                 skill = get_telegram_skill()
@@ -4474,7 +4489,7 @@ class DaemonService:
             )
             return False
 
-        if self.platform == "discord":
+        if self.platform in ("discord", "slack"):
             state["force_new_thread_once"] = True
             self._clear_selected_task_state(state)
             self._clear_temp_task_seed(state)
@@ -6485,9 +6500,93 @@ class DaemonService:
         self._discord_relay_proc = None
         self._log("Discord relay stopped")
 
+    def _start_slack_relay(self) -> None:
+        """Slack relay 프로세스를 시작합니다 (SONOLBOT_PLATFORM=slack 시 호출)."""
+        relay_script = self.root / "slack_relay.py"
+        if not relay_script.exists():
+            self._log("WARN: slack_relay.py not found, Slack relay not started")
+            return
+        if not os.getenv("SLACK_BOT_TOKEN", "").strip():
+            self._log("WARN: SLACK_BOT_TOKEN not set, Slack relay not started")
+            return
+        if not os.getenv("SLACK_APP_TOKEN", "").strip():
+            self._log("WARN: SLACK_APP_TOKEN not set, Slack relay not started")
+            return
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(relay_script)],
+                cwd=str(self.root),
+                env=os.environ.copy(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=(os.name != "nt"),
+            )
+            self._slack_relay_proc = proc
+            self._log(f"Slack relay started pid={proc.pid}")
+        except Exception as exc:
+            self._log(f"WARN: failed to start Slack relay: {exc}")
+
+    def _stop_slack_relay(self) -> None:
+        """Slack relay 프로세스를 종료합니다."""
+        proc = getattr(self, "_slack_relay_proc", None)
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self._slack_relay_proc = None
+        self._log("Slack relay stopped")
+
+    def _start_krc_worker(self) -> None:
+        """KRC 발주공고 작업 큐 워커 프로세스를 시작합니다."""
+        worker_script = self.root / "krc_worker.py"
+        if not worker_script.exists():
+            self._log("WARN: krc_worker.py not found, KRC worker not started")
+            return
+        if not os.getenv("KRC_API_BASE", "").strip():
+            self._log("WARN: KRC_API_BASE not set, KRC worker not started")
+            return
+        if not os.getenv("WORKER_SECRET", "").strip():
+            self._log("WARN: WORKER_SECRET not set, KRC worker not started")
+            return
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(worker_script)],
+                cwd=str(self.root),
+                env=os.environ.copy(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=(os.name != "nt"),
+            )
+            self._krc_worker_proc = proc
+            self._log(f"KRC worker started pid={proc.pid}")
+        except Exception as exc:
+            self._log(f"WARN: failed to start KRC worker: {exc}")
+
+    def _stop_krc_worker(self) -> None:
+        """KRC 워커 프로세스를 종료합니다."""
+        proc = getattr(self, "_krc_worker_proc", None)
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self._krc_worker_proc = None
+        self._log("KRC worker stopped")
+
     def run(self) -> int:
         ai_provider = os.getenv("SONOLBOT_AI_PROVIDER", "codex").strip().lower()
-        if ai_provider != "claude" and not shutil.which("codex"):
+        if ai_provider not in ("claude", "hybrid") and not shutil.which("codex"):
             self._log("ERROR: codex CLI not found in PATH (set SONOLBOT_AI_PROVIDER=claude to use Claude instead)")
             return 1
 
@@ -6524,9 +6623,14 @@ class DaemonService:
         )
         self._run_doc_runtime_check()
 
-        # Discord 플랫폼이면 relay 프로세스 시작
+        # 플랫폼별 relay 프로세스 시작
         if self.platform == "discord":
             self._start_discord_relay()
+        elif self.platform == "slack":
+            self._start_slack_relay()
+
+        # KRC 발주공고 워커 (플랫폼 무관하게 항상 시작)
+        self._start_krc_worker()
 
         try:
             while not self.stop_requested:
@@ -6536,6 +6640,9 @@ class DaemonService:
             self._stop_app_server("daemon_shutdown")
             if self.platform == "discord":
                 self._stop_discord_relay()
+            elif self.platform == "slack":
+                self._stop_slack_relay()
+            self._stop_krc_worker()
             self._release_lock()
             self._log("Daemon stopped")
         return 0
@@ -6679,18 +6786,36 @@ class MultiBotManager:
             bot_id = str(row.get("bot_id") or "").strip()
             if not token or not bot_id:
                 continue
-            if not normalized_allowed:
-                # Global allowed-users is required by current telegram skill contract.
+            platform = str(row.get("platform") or "telegram").strip().lower()
+            if platform == "telegram" and not normalized_allowed:
+                # 텔레그램 스킬 계약상 전역 허용 사용자가 필수.
                 continue
-            out.append(
-                {
-                    "bot_id": bot_id,
-                    "token": token,
-                    "bot_username": str(row.get("bot_username") or "").strip(),
-                    "bot_name": str(row.get("bot_name") or "").strip(),
-                    "allowed_users_global": normalized_allowed,
-                }
-            )
+            if platform == "discord" and not str(
+                row.get("discord_allowed_users") or ""
+            ).strip() and not normalized_allowed:
+                continue
+            if platform == "slack" and not str(
+                row.get("slack_app_token") or ""
+            ).strip():
+                # 슬랙은 App-Level Token이 필수
+                continue
+            entry = {
+                "bot_id": bot_id,
+                "token": token,
+                "platform": platform,
+                "bot_username": str(row.get("bot_username") or "").strip(),
+                "bot_name": str(row.get("bot_name") or "").strip(),
+                "allowed_users_global": normalized_allowed,
+            }
+            if platform == "discord":
+                entry["discord_allowed_users"] = str(
+                    row.get("discord_allowed_users") or ""
+                ).strip()
+            if platform == "slack":
+                entry["slack_app_token"] = str(row.get("slack_app_token") or "").strip()
+                entry["slack_allowed_users"] = str(row.get("slack_allowed_users") or "").strip()
+                entry["slack_allowed_channels"] = str(row.get("slack_allowed_channels") or "").strip()
+            out.append(entry)
         return out
 
     def _worker_env(self, bot: dict[str, Any], workspace: Path) -> dict[str, str]:
@@ -6726,14 +6851,32 @@ class MultiBotManager:
         env["SONOLBOT_BOTS_CONFIG"] = str(self.config_path)
 
         # 플랫폼 및 AI 프로바이더 전파
-        env["SONOLBOT_PLATFORM"] = str(bot.get("platform", "telegram"))
-        if bot.get("platform") == "discord":
-            env["DISCORD_BOT_TOKEN"] = str(bot.get("discord_token", ""))
-            env["DISCORD_ALLOWED_USERS"] = str(bot.get("discord_allowed_users", allowed_raw))
+        platform = str(bot.get("platform") or "telegram").strip().lower()
+        env["SONOLBOT_PLATFORM"] = platform
+        if platform == "discord":
+            env["DISCORD_BOT_TOKEN"] = str(bot["token"])
+            env["DISCORD_ALLOWED_USERS"] = str(
+                bot.get("discord_allowed_users") or allowed_raw
+            )
             env["DISCORD_MESSAGE_STORE"] = str(messages_dir / "discord_messages.json")
             env.pop("TELEGRAM_BOT_TOKEN", None)
+            env.pop("SLACK_BOT_TOKEN", None)
+            env.pop("SLACK_APP_TOKEN", None)
+        elif platform == "slack":
+            env["SLACK_BOT_TOKEN"] = str(bot["token"])
+            env["SLACK_APP_TOKEN"] = str(bot.get("slack_app_token") or "")
+            env["SLACK_ALLOWED_USERS"] = str(bot.get("slack_allowed_users") or "")
+            env["SLACK_ALLOWED_CHANNELS"] = str(bot.get("slack_allowed_channels") or "")
+            env["SLACK_MESSAGE_STORE"] = str(messages_dir / "slack_messages.json")
+            env.pop("TELEGRAM_BOT_TOKEN", None)
+            env.pop("DISCORD_BOT_TOKEN", None)
+            env.pop("DISCORD_ALLOWED_USERS", None)
         else:
             env["TELEGRAM_BOT_TOKEN"] = str(bot["token"])
+            env.pop("DISCORD_BOT_TOKEN", None)
+            env.pop("DISCORD_ALLOWED_USERS", None)
+            env.pop("SLACK_BOT_TOKEN", None)
+            env.pop("SLACK_APP_TOKEN", None)
         env["TELEGRAM_ALLOWED_USERS"] = allowed_raw
         env["TELEGRAM_USER_ID"] = str(allowed_users[0]) if allowed_users else ""
 
@@ -6744,6 +6887,7 @@ class MultiBotManager:
         env["TELEGRAM_LOGS_DIR"] = str(logs_dir)
         env["TASKS_LOGS_DIR"] = str(logs_dir)
         env["TELEGRAM_MESSAGE_STORE"] = str(messages_dir / "telegram_messages.json")
+        env.setdefault("SLACK_MESSAGE_STORE", str(messages_dir / "slack_messages.json"))
         env["DAEMON_ACTIVITY_FILE"] = str(logs_dir / "codex-app-server.log")
         env["DAEMON_APP_SERVER_LOG_FILE"] = str(logs_dir / "codex-app-server.log")
         env["DAEMON_APP_SERVER_STATE_FILE"] = str(state_dir / "codex-app-session-state.json")
@@ -6898,7 +7042,7 @@ class MultiBotManager:
 
     def run(self) -> int:
         ai_provider = os.getenv("SONOLBOT_AI_PROVIDER", "codex").strip().lower()
-        if ai_provider != "claude" and not shutil.which("codex"):
+        if ai_provider not in ("claude", "hybrid") and not shutil.which("codex"):
             self._log("ERROR: codex CLI not found in PATH (set SONOLBOT_AI_PROVIDER=claude to use Claude instead)")
             return 1
         signal.signal(signal.SIGINT, self._handle_signal)

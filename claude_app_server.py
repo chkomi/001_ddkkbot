@@ -42,6 +42,55 @@ load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 BASE_DIR = Path(__file__).resolve().parent
 IS_REWRITER = os.getenv("SONOLBOT_AGENT_REWRITER", "0").strip() == "1"
 
+# ── 하이브리드 모드 설정 ──────────────────────────────────────────────────────────
+# SONOLBOT_HYBRID_CODEX=1 이면 이미지 작업 감지 시 Codex에 위임
+HYBRID_CODEX_ENABLED = os.getenv("SONOLBOT_HYBRID_CODEX", "0").strip() == "1"
+
+_IMAGE_KEYWORDS: frozenset[str] = frozenset([
+    # Codex 스킬 트리거
+    "$imagegen",
+    # 한국어
+    "이미지", "그려줘", "그려", "그림 그려", "그림 만들", "사진 만들", "사진 생성",
+    "일러스트", "배경화면", "포스터", "썸네일", "비주얼 만들",
+    # 영어
+    "draw ", "generate image", "create image", "make image",
+    "make a picture", "/imagine", "image of", "draw a", "dalle", "midjourney",
+])
+
+
+def _is_image_task(text: str) -> bool:
+    lower = text.lower()
+    return any(kw in lower for kw in _IMAGE_KEYWORDS)
+
+
+def _find_codex_cli() -> str:
+    found = shutil.which("codex")
+    if found:
+        return found
+    candidates = [
+        Path.home() / ".npm-global" / "bin" / "codex",
+        Path.home() / ".npm" / "bin" / "codex",
+        Path("/usr/local/bin/codex"),
+        Path("/opt/homebrew/bin/codex"),
+    ]
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    raise FileNotFoundError(
+        "codex CLI를 찾을 수 없습니다.\n설치: npm install -g @openai/codex"
+    )
+
+
+_CODEX_CLI: str | None = None
+
+
+def _get_codex_cli() -> str:
+    global _CODEX_CLI
+    if _CODEX_CLI is None:
+        _CODEX_CLI = _find_codex_cli()
+    return _CODEX_CLI
+
+
 # ── Claude CLI 경로 탐색 ───────────────────────────────────────────────────────
 
 def _find_claude_cli() -> str:
@@ -161,6 +210,97 @@ class ClaudeAppServer:
         ])
         return cmd
 
+    # ── Codex 위임 ────────────────────────────────────────────────────────────
+
+    def _process_turn_with_codex(self, thread_id: str, turn_id: str, user_text: str) -> None:
+        """이미지 작업을 Codex exec에 위임하고 결과를 relay합니다."""
+        self._emit_notification("codex/event/agent_message", {
+            "threadId": thread_id,
+            "message": "이미지 작업을 Codex에 위임 중입니다...",
+        })
+
+        final_text = ""
+        try:
+            codex = _get_codex_cli()
+            model = os.getenv("SONOLBOT_CODEX_MODEL", os.getenv("DAEMON_CODEX_MODEL", "")).strip()
+            cmd = [codex, "exec", "--json", "--skip-git-repo-check"]
+            if model:
+                cmd.extend(["-c", f"model=\"{model}\""])
+            cmd.append(user_text)
+
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(BASE_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env={**os.environ, "TERM": "dumb", "NO_COLOR": "1"},
+            )
+            assert proc.stdout is not None
+
+            for raw in proc.stdout:
+                line = raw.rstrip("\n")
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    ev_type = str(obj.get("type") or "").lower()
+                    # codex exec --json 형식: {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+                    if ev_type == "item.completed":
+                        item = obj.get("item") or {}
+                        item_type = str(item.get("type") or "").lower()
+                        if item_type == "agent_message":
+                            msg = str(item.get("text") or "").strip()
+                            if msg:
+                                self._emit_notification("codex/event/agent_message", {
+                                    "threadId": thread_id,
+                                    "message": msg,
+                                })
+                                final_text = msg
+                    # 레거시/기타 형식 fallback
+                    elif ev_type in ("agent_message", "message", "text", "assistant"):
+                        msg = str(
+                            obj.get("content") or obj.get("message") or obj.get("text") or ""
+                        ).strip()
+                        if msg:
+                            self._emit_notification("codex/event/agent_message", {
+                                "threadId": thread_id,
+                                "message": msg,
+                            })
+                            final_text = msg
+                    elif ev_type in ("result", "done", "completed"):
+                        result = str(
+                            obj.get("result") or obj.get("content") or obj.get("text") or ""
+                        ).strip()
+                        if result:
+                            final_text = result
+                except json.JSONDecodeError:
+                    pass  # "Reading additional input from stdin..." 등 비JSON 줄 무시
+
+            proc.wait()
+
+            if not final_text and proc.returncode != 0:
+                stderr_out = (proc.stderr.read() if proc.stderr else "").strip()
+                final_text = f"[Codex 오류] 실행 실패 (종료코드: {proc.returncode})"
+                if stderr_out:
+                    final_text += f"\n{stderr_out[:300]}"
+
+        except FileNotFoundError as e:
+            final_text = f"[오류] {e}"
+        except Exception as e:
+            final_text = f"[오류] Codex 위임 중 문제 발생: {type(e).__name__}: {e}"
+
+        if final_text:
+            self._emit_notification("codex/event/task_complete", {
+                "conversationId": thread_id,
+                "msg": {"last_agent_message": final_text},
+            })
+        self._emit_notification("turn/completed", {
+            "threadId": thread_id,
+            "turn": {"id": turn_id, "status": "completed", "finalMessage": final_text},
+        })
+
     # ── Turn 처리 ──────────────────────────────────────────────────────────────
 
     def _handle_turn_start(self, req_id: int, params: dict[str, Any]) -> None:
@@ -193,6 +333,11 @@ class ClaudeAppServer:
 
     def _process_turn(self, thread_id: str, turn_id: str, user_text: str) -> None:
         """claude CLI를 실행하고 결과를 스트리밍합니다."""
+        # 하이브리드 모드: 이미지 작업은 Codex에 위임
+        if not IS_REWRITER and HYBRID_CODEX_ENABLED and _is_image_task(user_text):
+            self._process_turn_with_codex(thread_id, turn_id, user_text)
+            return
+
         session_id = self._sessions.get(thread_id)
 
         if IS_REWRITER:

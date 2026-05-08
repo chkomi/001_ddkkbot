@@ -45,6 +45,13 @@ bots/
 # .codex 설정 (로컬)
 .codex/
 
+# 봇 설정 (토큰 포함)
+.control_panel_telegram_bots.json
+
+# 임시/생성 파일
+artifacts/
+tmp/
+
 # OS 파일
 .DS_Store
 Thumbs.db

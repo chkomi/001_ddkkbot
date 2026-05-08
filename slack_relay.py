@@ -53,6 +53,37 @@ except ImportError:
     logger.error("slack-bolt가 설치되지 않았습니다. pip install slack-bolt 를 실행하세요.")
     sys.exit(1)
 
+# 슬랙 스킬에서 ID 인코더 재사용 (.codex/skills/sonolbot-slack/scripts/slack_io.py)
+_SKILL_PATH = BASE_DIR / ".codex" / "skills" / "sonolbot-slack" / "scripts"
+if str(_SKILL_PATH) not in sys.path:
+    sys.path.insert(0, str(_SKILL_PATH))
+try:
+    from slack_io import encode_slack_id, encode_slack_ts  # type: ignore
+except ImportError:
+    # 폴백: 인라인 정의
+    _BASE36_DIGITS_LOCAL = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    def encode_slack_id(value: str) -> int:  # type: ignore
+        s = (value or "").strip().upper()
+        try:
+            return int(s, 36) if s else 0
+        except ValueError:
+            return abs(hash(s)) & ((1 << 60) - 1)
+    def encode_slack_ts(ts: str) -> int:  # type: ignore
+        s = (ts or "").strip()
+        if not s:
+            return 0
+        if "." in s:
+            secs, frac = s.split(".", 1)
+            frac = (frac + "000000")[:6]
+            try:
+                return int(secs) * 1_000_000 + int(frac)
+            except ValueError:
+                return 0
+        try:
+            return int(s) * 1_000_000
+        except ValueError:
+            return 0
+
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "").strip()
 APP_TOKEN = os.getenv("SLACK_APP_TOKEN", "").strip()
@@ -118,21 +149,34 @@ def append_slack_message(
     text: str,
     files: list[dict] | None = None,
 ) -> None:
+    """슬랙 메시지를 store 에 저장.
+
+    데몬 본체가 chat_id/user_id/message_id 를 int 로 다루기 때문에 base36
+    인코딩한 int 형태로 저장하고, 원본 문자열도 디버그용으로 함께 보존한다.
+    """
+    chat_id_int = encode_slack_id(channel_id)
+    user_id_int = encode_slack_id(user_id)
+    msg_id_int = encode_slack_ts(message_id)
+
     with _store_lock:
         store = _load_store()
         last_id = int(store.get("last_update_id", 0))
         store["last_update_id"] = last_id + 1
 
         entry: dict = {
-            "message_id": message_id,       # Slack ts (예: "1234567890.123456")
-            "chat_id": channel_id,           # Slack channel ID (C...)
-            "user_id": user_id,              # Slack user ID (U...)
+            "message_id": msg_id_int,
+            "chat_id": chat_id_int,
+            "user_id": user_id_int,
             "username": username,
             "type": "user",
             "text": text,
             "timestamp": datetime.now().isoformat(),
             "processed": False,
             "source": "slack",
+            # 디버그/추적용 원본 (데몬은 사용하지 않음)
+            "_slack_message_ts": message_id,
+            "_slack_channel_id": channel_id,
+            "_slack_user_id": user_id,
         }
         if files:
             entry["files"] = files
@@ -142,7 +186,10 @@ def append_slack_message(
         store["messages"] = _prune_old_messages(messages)
         _save_store(store)
 
-    logger.info(f"메시지 저장: channel={channel_id} user={user_id} ({username}) text={text[:50]!r}")
+    logger.info(
+        f"메시지 저장: channel={channel_id} ({chat_id_int}) "
+        f"user={user_id} ({user_id_int}) text={text[:50]!r}"
+    )
 
 
 # ── Slack 앱 이벤트 핸들러 ──────────────────────────────────────────────────────
@@ -211,6 +258,58 @@ def handle_mention(event: dict, client, logger: logging.Logger) -> None:
     """멘션도 동일하게 처리 (message 이벤트와 중복 방지)."""
     # message 이벤트로 이미 처리되므로 별도 로직 없음
     pass
+
+
+@app.action(re.compile(r"^btn_.*"))
+def handle_button_action(ack, body, client, logger: logging.Logger) -> None:
+    """Block Kit 버튼 클릭 처리.
+
+    텔레그램의 reply keyboard 와 동일하게, 클릭한 라벨을 사용자 메시지로
+    store 에 추가해 daemon 이 동일한 입력 흐름을 타도록 한다.
+    """
+    ack()  # 3초 내 ACK 필수 — 안 하면 슬랙이 "responded too late" 경고
+    try:
+        actions = body.get("actions") or []
+        if not actions:
+            return
+        action = actions[0]
+        label = str(action.get("value") or action.get("text", {}).get("text") or "").strip()
+        if not label:
+            return
+
+        user = body.get("user") or {}
+        user_id = str(user.get("id") or "")
+        username = str(user.get("name") or user_id or "user")
+
+        channel = body.get("channel") or {}
+        channel_id = str(channel.get("id") or "")
+        if not channel_id or not user_id:
+            return
+
+        if _ALLOWED_USERS and user_id not in _ALLOWED_USERS:
+            return
+        if _ALLOWED_CHANNELS and channel_id not in _ALLOWED_CHANNELS:
+            return
+
+        # 합성 ts (실제 클릭 시각 기반)
+        synthetic_ts = body.get("trigger_id") or body.get("action_ts") or ""
+        if not synthetic_ts or "." not in str(synthetic_ts):
+            from time import time as _now
+            synthetic_ts = f"{_now():.6f}"
+
+        append_slack_message(
+            message_id=str(synthetic_ts),
+            channel_id=channel_id,
+            user_id=user_id,
+            username=username,
+            text=label,
+            files=None,
+        )
+        logger.info(
+            f"버튼 클릭 → 메시지 저장: channel={channel_id} user={user_id} label={label!r}"
+        )
+    except Exception as exc:
+        logger.error(f"버튼 클릭 처리 실패: {exc}")
 
 
 def main() -> None:

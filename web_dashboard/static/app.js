@@ -2,6 +2,7 @@
 
 const API = {
   status:  () => fetch('/api/status').then(r => r.json()),
+  authStatus: () => fetch('/api/auth-status').then(r => r.json()),
   tasks:   (limit=20) => fetch(`/api/tasks?limit=${limit}`).then(r => r.json()),
   settings: () => fetch('/api/settings').then(r => r.json()),
   saveSetting: (key, value) => fetch('/api/settings', {
@@ -11,6 +12,24 @@ const API = {
   }).then(r => r.json()),
   start: () => fetch('/api/daemon/start', {method:'POST'}).then(r => r.json()),
   stop:  () => fetch('/api/daemon/stop',  {method:'POST'}).then(r => r.json()),
+  botsList: () => fetch('/api/bots').then(r => r.json()),
+  botCreate: (body) => fetch('/api/bots', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).then(async r => ({ok: r.ok, status: r.status, data: await r.json().catch(()=>({}))})),
+  botUpdate: (botId, body) => fetch(`/api/bots/${encodeURIComponent(botId)}`, {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).then(async r => ({ok: r.ok, status: r.status, data: await r.json().catch(()=>({}))})),
+  botDelete: (botId) => fetch(`/api/bots/${encodeURIComponent(botId)}`, {method:'DELETE'})
+    .then(async r => ({ok: r.ok, status: r.status, data: await r.json().catch(()=>({}))})),
+  setAllowedUsers: (userIds) => fetch('/api/bots/allowed-users', {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({user_ids: userIds})
+  }).then(async r => ({ok: r.ok, status: r.status, data: await r.json().catch(()=>({}))})),
 };
 
 // ── 상태 ──────────────────────────────────────────────────────────────────────
@@ -31,7 +50,8 @@ function showSection(name) {
   });
   if (name === 'logs' && !logEventSource) startLogStream();
   if (name === 'tasks') loadTasks();
-  if (name === 'settings') loadSettings();
+  if (name === 'settings') { loadSettings(); refreshAuthStatus(); }
+  if (name === 'bots') loadBots();
 }
 
 // ── 상태 패널 ──────────────────────────────────────────────────────────────────
@@ -43,6 +63,60 @@ async function refreshStatus() {
   } catch(e) {
     renderStatus(null);
   }
+}
+
+async function refreshAuthStatus() {
+  const list = document.getElementById('auth-list');
+  if (!list) return;
+  try {
+    const data = await API.authStatus();
+    renderAuthStatus(data);
+  } catch(e) {
+    list.innerHTML = '<div class="empty-state">인증 상태 로딩 실패</div>';
+  }
+}
+
+function renderAuthStatus(data) {
+  const targets = ['auth-list', 'auth-list-settings']
+    .map(id => document.getElementById(id))
+    .filter(Boolean);
+  if (!targets.length) return;
+  const list = targets[0]; // 아래 로직의 호환성 유지용
+  const providers = [
+    { id: 'codex',  icon: '⚡', name: 'Codex',  data: data?.codex  },
+    { id: 'claude', icon: '◈', name: 'Claude', data: data?.claude },
+  ];
+  const html = providers.map(p => {
+    const d = p.data || {};
+    let badge, badgeClass, detail = '';
+    if (!d.installed) {
+      badge = 'CLI 미설치';
+      badgeClass = 'badge-muted';
+    } else if (d.logged_in) {
+      badge = '로그인';
+      badgeClass = 'badge-green';
+      const parts = [];
+      if (d.email) parts.push(d.email);
+      if (d.method) parts.push(`(${d.method})`);
+      if (d.subscription_type) parts.push(`· ${d.subscription_type}`);
+      if (d.subscription_until) parts.push(`~ ${d.subscription_until}`);
+      detail = parts.join(' ');
+      if (!detail && d.message) detail = d.message;
+    } else {
+      badge = '로그아웃';
+      badgeClass = 'badge-muted';
+      detail = d.message || '';
+    }
+    return `<div class="messenger-item ${d.logged_in ? 'enabled' : ''}">
+      <div class="messenger-icon">${p.icon}</div>
+      <div class="messenger-info">
+        <div class="messenger-name">${p.name}</div>
+        <div class="messenger-detail">${escHtml(detail || '-')}</div>
+      </div>
+      <span class="badge ${badgeClass}">${badge}</span>
+    </div>`;
+  }).join('');
+  targets.forEach(el => { el.innerHTML = html; });
 }
 
 function renderStatus(data) {
@@ -131,6 +205,171 @@ function statusDotClass(status) {
   if (s === 'blocked')   return 'blocked';
   if (s === 'completed' || s === 'updated') return 'completed';
   return 'active';
+}
+
+// ── 봇 관리 ────────────────────────────────────────────────────────────────────
+
+async function loadBots() {
+  const list = document.getElementById('bot-list');
+  if (!list) return;
+  list.innerHTML = '<div class="empty-state">불러오는 중...</div>';
+  try {
+    const data = await API.botsList();
+    renderBots(data.bots || []);
+    const input = document.getElementById('allowed-users-input');
+    if (input) input.value = (data.allowed_users_global || []).join(', ');
+  } catch (e) {
+    list.innerHTML = '<div class="empty-state">로딩 실패</div>';
+  }
+}
+
+function renderBots(bots) {
+  const list = document.getElementById('bot-list');
+  if (!list) return;
+  if (!bots.length) {
+    list.innerHTML = '<div class="empty-state">등록된 봇이 없습니다. ＋ 봇 추가 버튼으로 새 봇을 등록하세요.</div>';
+    return;
+  }
+  list.innerHTML = bots.map(b => {
+    const icon = b.platform === 'discord' ? '🎮' : (b.platform === 'slack' ? '💬' : '✈️');
+    const platformLabel = b.platform === 'discord' ? 'Discord' : (b.platform === 'slack' ? 'Slack' : 'Telegram');
+    const subtitle = [b.bot_username && `@${b.bot_username}`, b.bot_id, b.token_masked]
+      .filter(Boolean)
+      .join(' · ');
+    const aliasOrName = b.alias || b.bot_name || b.bot_id;
+    return `<div class="bot-card ${b.active ? '' : 'inactive'}" data-bot-id="${escHtml(b.bot_id)}">
+      <div class="bot-icon">${icon}</div>
+      <div class="bot-info-main">
+        <div class="bot-info-title">
+          <span>${escHtml(aliasOrName)}</span>
+          <span class="badge ${b.platform === 'discord' ? 'badge-muted' : 'badge-muted'}">${platformLabel}</span>
+        </div>
+        <div class="bot-info-meta">${escHtml(subtitle)}</div>
+      </div>
+      <div class="bot-actions">
+        <label class="toggle-switch" title="${b.active ? '비활성화' : '활성화'}">
+          <input type="checkbox" ${b.active ? 'checked' : ''} onchange="toggleBotActive('${escAttr(b.bot_id)}', this.checked)">
+          <span class="toggle-slider"></span>
+        </label>
+        <button class="btn btn-ghost" title="삭제" onclick="deleteBot('${escAttr(b.bot_id)}')">🗑</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+let _modalPlatform = 'telegram';
+
+function openAddBotDialog() {
+  _modalPlatform = 'telegram';
+  ['modal-token', 'modal-alias', 'modal-discord-allowed',
+   'modal-slack-app', 'modal-slack-allowed', 'modal-slack-channels'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  document.getElementById('modal-active').checked = true;
+  selectModalPlatform('telegram');
+  document.getElementById('bot-modal').style.display = 'flex';
+}
+
+function closeAddBotDialog(e) {
+  if (e && e.target.id !== 'bot-modal' && e.type === 'click') return;
+  document.getElementById('bot-modal').style.display = 'none';
+}
+
+function selectModalPlatform(p) {
+  _modalPlatform = p;
+  document.querySelectorAll('#modal-platform .provider-btn').forEach(btn => {
+    btn.classList.toggle('selected', btn.dataset.platform === p);
+  });
+  const isDiscord = (p === 'discord');
+  const isSlack = (p === 'slack');
+  document.getElementById('modal-discord-allowed-row').style.display = isDiscord ? '' : 'none';
+  document.getElementById('modal-slack-app-row').style.display = isSlack ? '' : 'none';
+  document.getElementById('modal-slack-allowed-row').style.display = isSlack ? '' : 'none';
+  document.getElementById('modal-slack-channels-row').style.display = isSlack ? '' : 'none';
+
+  const tokenInput = document.getElementById('modal-token');
+  const tokenLabel = document.getElementById('modal-token-label');
+  if (p === 'telegram') {
+    tokenLabel.textContent = '봇 토큰';
+    tokenInput.placeholder = '123456:ABC...';
+  } else if (p === 'discord') {
+    tokenLabel.textContent = '봇 토큰';
+    tokenInput.placeholder = '디스코드 봇 토큰';
+  } else if (p === 'slack') {
+    tokenLabel.textContent = 'Slack Bot Token (xoxb-…)';
+    tokenInput.placeholder = 'xoxb-...';
+  }
+}
+
+async function submitAddBot() {
+  const submitBtn = document.getElementById('modal-submit-btn');
+  const body = {
+    platform: _modalPlatform,
+    token: document.getElementById('modal-token').value.trim(),
+    alias: document.getElementById('modal-alias').value.trim(),
+    active: document.getElementById('modal-active').checked,
+    discord_allowed_users: document.getElementById('modal-discord-allowed').value.trim(),
+    slack_app_token: document.getElementById('modal-slack-app').value.trim(),
+    slack_allowed_users: document.getElementById('modal-slack-allowed').value.trim(),
+    slack_allowed_channels: document.getElementById('modal-slack-channels').value.trim(),
+  };
+  if (!body.token) { showToast('토큰을 입력하세요', true); return; }
+  if (_modalPlatform === 'slack' && !body.slack_app_token) {
+    showToast('Slack App-Level Token도 필요합니다', true); return;
+  }
+  submitBtn.disabled = true;
+  try {
+    const r = await API.botCreate(body);
+    if (!r.ok) {
+      showToast(r.data?.detail || '추가 실패', true);
+      return;
+    }
+    showToast('봇이 추가되었습니다');
+    closeAddBotDialog();
+    loadBots();
+  } catch (e) {
+    showToast('추가 오류', true);
+  } finally {
+    submitBtn.disabled = false;
+  }
+}
+
+async function toggleBotActive(botId, active) {
+  const r = await API.botUpdate(botId, { active });
+  if (!r.ok) {
+    showToast(r.data?.detail || '변경 실패', true);
+    loadBots();
+    return;
+  }
+  showToast(active ? '활성화됨' : '비활성화됨');
+  loadBots();
+}
+
+async function deleteBot(botId) {
+  if (!confirm(`정말 삭제하시겠습니까?\n${botId}`)) return;
+  const r = await API.botDelete(botId);
+  if (!r.ok) {
+    showToast(r.data?.detail || '삭제 실패', true);
+    return;
+  }
+  showToast('삭제됨');
+  loadBots();
+}
+
+async function saveAllowedUsers() {
+  const raw = document.getElementById('allowed-users-input').value;
+  const ids = raw.split(/[,\s]+/).map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n) && n > 0);
+  const r = await API.setAllowedUsers(ids);
+  if (!r.ok) {
+    showToast(r.data?.detail || '저장 실패', true);
+    return;
+  }
+  showToast('허용 사용자 저장됨');
+  loadBots();
+}
+
+function escAttr(s) {
+  return String(s).replace(/'/g, "\\'").replace(/"/g, '&quot;');
 }
 
 // ── 설정 ──────────────────────────────────────────────────────────────────────
@@ -302,5 +541,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // 초기 섹션
   showSection('dashboard');
   refreshStatus();
+  refreshAuthStatus();
   setInterval(refreshStatus, 5000);
+  setInterval(refreshAuthStatus, 30000);
 });

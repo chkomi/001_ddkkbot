@@ -27,6 +27,9 @@
     <button class="nav-item active" data-section="dashboard">
       <span class="nav-icon">⬡</span> 대시보드
     </button>
+    <button class="nav-item" data-section="bots">
+      <span class="nav-icon">◉</span> 봇 관리
+    </button>
     <button class="nav-item" data-section="tasks">
       <span class="nav-icon">◈</span> 작업 목록
     </button>
@@ -79,9 +82,24 @@
             <span class="provider-name">Claude</span>
             <span class="provider-desc">Claude Code CLI</span>
           </button>
+          <button class="provider-btn" data-provider="hybrid" onclick="setAIProvider('hybrid')">
+            <span class="provider-icon">⚡◈</span>
+            <span class="provider-name">Hybrid</span>
+            <span class="provider-desc">Claude 주 + 이미지→Codex</span>
+          </button>
         </div>
         <div class="card-sub" style="color:var(--text-muted); font-size:11px; margin-top:4px;">
           변경 후 봇을 재시작해야 적용됩니다.
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">프로바이더 로그인 상태</div>
+        <div class="auth-list" id="auth-list">
+          <div class="empty-state">불러오는 중...</div>
+        </div>
+        <div class="card-sub" style="color:var(--text-muted); font-size:11px; margin-top:4px;">
+          터미널에서 <code>codex login</code> / <code>claude auth login</code> 으로 로그인할 수 있습니다.
         </div>
       </div>
 
@@ -90,6 +108,91 @@
         <div class="messenger-list" id="messenger-list"></div>
       </div>
 
+    </div>
+
+    <!-- ── 봇 관리 패널 ──────────────────────────────── -->
+    <div id="panel-bots" class="section-panel" style="flex-direction:column; gap:20px; display:none;">
+      <div class="section">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div class="section-title">등록된 봇</div>
+          <button class="btn btn-primary" onclick="openAddBotDialog()">＋ 봇 추가</button>
+        </div>
+        <div class="bot-list" id="bot-list">
+          <div class="empty-state">불러오는 중...</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">텔레그램 전역 허용 사용자 ID</div>
+        <div class="card-sub" style="font-size:11px; color:var(--text-muted);">
+          쉼표 또는 공백으로 구분된 텔레그램 사용자 ID. 텔레그램 봇이 메시지에 응답하려면 이 목록에 보낸이의 ID가 있어야 합니다.
+        </div>
+        <div style="display:flex; gap:8px; margin-top:8px;">
+          <input class="form-input" id="allowed-users-input" placeholder="예: 1669122766, 392258..." style="flex:1;">
+          <button class="btn btn-primary" onclick="saveAllowedUsers()">저장</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── 봇 추가 모달 ──────────────────────────────── -->
+    <div id="bot-modal" class="modal-backdrop" style="display:none;" onclick="closeAddBotDialog(event)">
+      <div class="modal-card" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <div class="modal-title" id="modal-title">새 봇 추가</div>
+          <button class="btn btn-ghost" onclick="closeAddBotDialog()">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-row">
+            <label class="form-label">플랫폼</label>
+            <div class="provider-toggle" id="modal-platform">
+              <button class="provider-btn selected" data-platform="telegram" onclick="selectModalPlatform('telegram')">
+                <span class="provider-icon">✈️</span>
+                <span class="provider-name">Telegram</span>
+              </button>
+              <button class="provider-btn" data-platform="discord" onclick="selectModalPlatform('discord')">
+                <span class="provider-icon">🎮</span>
+                <span class="provider-name">Discord</span>
+              </button>
+              <button class="provider-btn" data-platform="slack" onclick="selectModalPlatform('slack')">
+                <span class="provider-icon">💬</span>
+                <span class="provider-name">Slack</span>
+              </button>
+            </div>
+          </div>
+          <div class="form-row">
+            <label class="form-label" for="modal-token"><span id="modal-token-label">토큰</span></label>
+            <input class="form-input" id="modal-token" placeholder="123456:ABC...">
+          </div>
+          <div class="form-row" id="modal-slack-app-row" style="display:none;">
+            <label class="form-label" for="modal-slack-app">Slack App-Level Token (xapp-…)</label>
+            <input class="form-input" id="modal-slack-app" placeholder="xapp-1-...">
+          </div>
+          <div class="form-row">
+            <label class="form-label" for="modal-alias">별명 (선택)</label>
+            <input class="form-input" id="modal-alias" placeholder="예: 운영봇">
+          </div>
+          <div class="form-row" id="modal-discord-allowed-row" style="display:none;">
+            <label class="form-label" for="modal-discord-allowed">디스코드 허용 사용자 ID</label>
+            <input class="form-input" id="modal-discord-allowed" placeholder="예: 392258398827184128 (쉼표 구분)">
+          </div>
+          <div class="form-row" id="modal-slack-allowed-row" style="display:none;">
+            <label class="form-label" for="modal-slack-allowed">슬랙 허용 사용자 ID</label>
+            <input class="form-input" id="modal-slack-allowed" placeholder="예: U0XXXXXX (쉼표 구분, 비워두면 모두 허용)">
+          </div>
+          <div class="form-row" id="modal-slack-channels-row" style="display:none;">
+            <label class="form-label" for="modal-slack-channels">슬랙 허용 채널 ID (선택)</label>
+            <input class="form-input" id="modal-slack-channels" placeholder="예: C0XXX,D0XXX (비워두면 모든 채널)">
+          </div>
+          <div class="form-row">
+            <label class="form-label" for="modal-active">즉시 활성화</label>
+            <input type="checkbox" id="modal-active" checked>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost" onclick="closeAddBotDialog()">취소</button>
+          <button class="btn btn-primary" id="modal-submit-btn" onclick="submitAddBot()">추가</button>
+        </div>
+      </div>
     </div>
 
     <!-- ── 작업 목록 패널 ──────────────────────────────── -->
@@ -111,6 +214,15 @@
 
     <!-- ── 설정 패널 ────────────────────────────────────── -->
     <div id="panel-settings" class="section-panel" style="flex-direction:column; gap:12px; display:none;">
+      <div class="section">
+        <div class="section-title">AI 로그인 상태</div>
+        <div class="auth-list" id="auth-list-settings">
+          <div class="empty-state">불러오는 중...</div>
+        </div>
+        <div class="card-sub" style="color:var(--text-muted); font-size:11px; margin-top:4px;">
+          터미널에서 <code>codex login</code> / <code>claude auth login</code> 으로 로그인할 수 있습니다.
+        </div>
+      </div>
       <div class="section-title">환경 설정</div>
       <div class="card-sub" style="font-size:11px; color:var(--text-muted);">
         민감한 값(토큰, 키)은 마스킹 표시됩니다. 직접 .env 파일을 편집하거나 아래에서 변경하세요.
